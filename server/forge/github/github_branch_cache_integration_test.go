@@ -116,3 +116,32 @@ func TestGitHubBranchesSecondaryRetryAfter(t *testing.T) {
 		t.Fatalf("Retry-After cooldown ignored: %d requests", requests.Load())
 	}
 }
+
+func TestGitHubBranchCooldownWaitsForBothHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		resetAfter time.Duration
+		retryAfter string
+		minimum    time.Duration
+	}{
+		{name: "primary reset later", status: http.StatusForbidden, resetAfter: 95 * time.Second, retryAfter: "5", minimum: 90 * time.Second},
+		{name: "retry after later", status: http.StatusTooManyRequests, resetAfter: 10 * time.Second, retryAfter: "95", minimum: 95 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := make(http.Header)
+			headers.Set("Retry-After", tt.retryAfter)
+			headers.Set("X-RateLimit-Remaining", "0")
+			headers.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(tt.resetAfter).Unix(), 10))
+			resp := &github.Response{Response: &http.Response{StatusCode: tt.status, Header: headers}}
+			if got := branchCooldown(resp, fmt.Errorf("rate limit")); got < tt.minimum {
+				t.Fatalf("cooldown %s is shorter than the required %s", got, tt.minimum)
+			}
+		})
+	}
+	permission := &github.Response{Response: &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header)}}
+	if got := branchCooldown(permission, fmt.Errorf("permission denied")); got != 0 {
+		t.Fatalf("ordinary permission 403 was incorrectly delayed: %s", got)
+	}
+}
