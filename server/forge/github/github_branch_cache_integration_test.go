@@ -96,3 +96,23 @@ func TestGitHubBranchesPermission403IsNotRateLimit(t *testing.T) {
 		t.Fatalf("ordinary 403 was cached as quota failure: %d", requests.Load())
 	}
 }
+
+func TestGitHubBranchesSecondaryRetryAfter(t *testing.T) {
+	ctx, forge, requests := testGithubBranchesClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"message":"secondary rate limit"}`)
+	})
+	for range 2 {
+		if result, err := forge.Branches(ctx,
+			&model.User{AccessToken: "token"}, &model.Repo{Owner: "octocat", Name: "repo"},
+			&model.ListOptions{Page: 1, PerPage: 50},
+		); err == nil || result != nil {
+			t.Fatalf("secondary rate-limit must not look successful, got %v, %v", result, err)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("Retry-After cooldown ignored: %d requests", requests.Load())
+	}
+}
