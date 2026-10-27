@@ -18,6 +18,7 @@ package github
 import (
 	"context"
 	"crypto/tls"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,6 +26,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/google/go-github/v93/github"
 	"github.com/rs/zerolog/log"
@@ -93,7 +96,19 @@ type client struct {
 	MergeRef   bool
 	OnlyPublic bool
 	oAuthHost  string
+	branchMu sync.Mutex
+	branchCache map[[32]byte]*branchCacheEntry
 }
+
+// branchCacheEntry holds only branch names; credential material is never cached.
+type branchCacheEntry struct {
+	done chan struct{}
+	names []string
+	expires time.Time
+}
+
+const branchCacheTTL = 15 * time.Second
+const maxBranchCacheEntries = 256
 
 // Name returns the string name of this driver.
 func (c *client) Name() string {
@@ -632,26 +647,73 @@ func (c *client) Activate(ctx context.Context, u *model.User, r *model.Repo, lin
 }
 
 // Branches returns the names of all branches for the named repository.
+// Identical reads from the same token are coalesced and briefly cached.
 func (c *client) Branches(ctx context.Context, u *model.User, r *model.Repo, p *model.ListOptions) ([]string, error) {
-	token := common.UserToken(ctx, r, u)
-	client, err := c.newClientToken(ctx, token)
-	if err != nil {
-		return nil, err
-	}
+ token := common.UserToken(ctx, r, u)
+ page, perPageValue := p.Page, perPage(p.PerPage)
+ // Hash the credential with all request parameters; never log or retain the token.
+ key := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%d\x00%d", token, c.API, r.Owner, r.Name, page, perPageValue)))
+ return c.cachedBranches(ctx, key, func() ([]string, error) {
+  gh, err := c.newClientToken(ctx, token)
+  if err != nil { return nil, err }
+  githubBranches, _, err := gh.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
+   Page: page, PerPage: perPageValue,
+  })
+  if err != nil { return nil, err }
+  names := make([]string, 0, len(githubBranches))
+  for _, branch := range githubBranches { names = append(names, branch.GetName()) }
+  return names, nil
+ })
+}
 
-	githubBranches, _, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
-		Page:    p.Page,
-		PerPage: perPage(p.PerPage),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	branches := make([]string, 0)
-	for _, branch := range githubBranches {
-		branches = append(branches, *branch.Name)
-	}
-	return branches, nil
+// cachedBranches never caches failures. Waiters may cancel without stopping the leader.
+func (c *client) cachedBranches(ctx context.Context, key [32]byte, fetch func() ([]string, error)) ([]string, error) {
+ c.branchMu.Lock()
+ if c.branchCache == nil { c.branchCache = make(map[[32]byte]*branchCacheEntry) }
+ if entry, ok := c.branchCache[key]; ok {
+  if entry.done != nil {
+   done := entry.done
+   c.branchMu.Unlock()
+   select {
+   case <-ctx.Done(): return nil, ctx.Err()
+   case <-done:
+    c.branchMu.Lock()
+    valid := entry.done == nil && time.Now().Before(entry.expires)
+    names := append([]string(nil), entry.names...)
+    c.branchMu.Unlock()
+    if valid { return names, nil }
+    return c.cachedBranches(ctx, key, fetch)
+   }
+  }
+  if time.Now().Before(entry.expires) {
+   names := append([]string(nil), entry.names...)
+   c.branchMu.Unlock()
+   return names, nil
+  }
+  delete(c.branchCache,key)
+ }
+ // Bound the cache. Evict only completed entries; never evict a running request.
+ if len(c.branchCache) >= maxBranchCacheEntries {
+  for k, e := range c.branchCache {
+   if e.done == nil { delete(c.branchCache,k) }
+  }
+ }
+ entry := &branchCacheEntry{done: make(chan struct{})}
+ c.branchCache[key]=entry
+ c.branchMu.Unlock()
+ names, err := fetch()
+ c.branchMu.Lock()
+ if err != nil {
+  delete(c.branchCache,key)
+ } else {
+  entry.names = append([]string(nil), names...)
+  entry.expires = time.Now().Add(branchCacheTTL)
+ }
+ close(entry.done)
+ entry.done = nil
+ c.branchMu.Unlock()
+ if err != nil { return nil, err }
+ return append([]string(nil), names...), nil
 }
 
 // BranchHead returns the sha of the head (latest commit) of the specified branch.
