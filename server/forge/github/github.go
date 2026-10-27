@@ -84,15 +84,15 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 }
 
 type client struct {
-	id         int64
-	url        string
-	API        string
-	Client     string
-	Secret     string
-	SkipVerify bool
-	MergeRef   bool
-	OnlyPublic bool
-	oAuthHost  string
+	id            int64
+	url           string
+	API           string
+	Client        string
+	Secret        string
+	SkipVerify    bool
+	MergeRef      bool
+	OnlyPublic    bool
+	oAuthHost     string
 	branchesCache branchCache
 }
 
