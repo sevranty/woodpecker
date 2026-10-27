@@ -666,26 +666,33 @@ func branchCooldown(resp *github.Response, err error) time.Duration {
 	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
 		return 0
 	}
+	var cooldown time.Duration
 	if raw := resp.Header.Get("Retry-After"); raw != "" {
-		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && seconds >= 0 {
-			return time.Duration(seconds+1) * time.Second
-		}
-		if reset, parseErr := http.ParseTime(raw); parseErr == nil && time.Until(reset) > 0 {
-			return time.Until(reset) + time.Second
-		}
-	}
-	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
-		if reset, parseErr := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
-			if delay := time.Until(time.Unix(reset, 0)); delay > 0 {
-				return delay + time.Second
+		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && seconds >= 0 && seconds < int64((1<<63-1)/int64(time.Second))-1 {
+			cooldown = time.Duration(seconds+1) * time.Second
+		} else if retryDate, parseErr := http.ParseTime(raw); parseErr == nil {
+			if delay := time.Until(retryDate); delay > 0 {
+				cooldown = delay + time.Second
 			}
 		}
+	}
+	// Primary reset and secondary Retry-After can appear together.
+	// Honor the later deadline so the cache never retries on an exhausted quota.
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		primaryDelay := time.Minute
+		if reset, parseErr := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
+			if delay := time.Until(time.Unix(reset, 0)); delay > 0 {
+				primaryDelay = delay + time.Second
+			}
+		}
+		if primaryDelay > cooldown {
+			cooldown = primaryDelay
+		}
+	}
+	if cooldown == 0 && (resp.StatusCode == http.StatusTooManyRequests || (err != nil && strings.Contains(strings.ToLower(err.Error()), "secondary rate limit"))) {
 		return time.Minute
 	}
-	if resp.StatusCode == http.StatusTooManyRequests || (err != nil && strings.Contains(strings.ToLower(err.Error()), "secondary rate limit")) {
-		return time.Minute
-	}
-	return 0
+	return cooldown
 }
 
 // BranchHead returns the sha of the head (latest commit) of the specified branch.
