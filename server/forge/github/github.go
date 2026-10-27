@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v93/github"
 	"github.com/rs/zerolog/log"
@@ -84,15 +85,16 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 }
 
 type client struct {
-	id         int64
-	url        string
-	API        string
-	Client     string
-	Secret     string
-	SkipVerify bool
-	MergeRef   bool
-	OnlyPublic bool
-	oAuthHost  string
+	id            int64
+	url           string
+	API           string
+	Client        string
+	Secret        string
+	SkipVerify    bool
+	MergeRef      bool
+	OnlyPublic    bool
+	oAuthHost     string
+	branchesCache branchCache
 }
 
 // Name returns the string name of this driver.
@@ -634,24 +636,56 @@ func (c *client) Activate(ctx context.Context, u *model.User, r *model.Repo, lin
 // Branches returns the names of all branches for the named repository.
 func (c *client) Branches(ctx context.Context, u *model.User, r *model.Repo, p *model.ListOptions) ([]string, error) {
 	token := common.UserToken(ctx, r, u)
-	client, err := c.newClientToken(ctx, token)
-	if err != nil {
-		return nil, err
-	}
-
-	githubBranches, _, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
-		Page:    p.Page,
-		PerPage: perPage(p.PerPage),
+	key := newBranchCacheKey(token, r.Owner, r.Name, p.Page, perPage(p.PerPage))
+	return c.branchesCache.get(ctx, key, func() ([]string, error, time.Duration) {
+		client, err := c.newClientToken(ctx, token)
+		if err != nil {
+			return nil, err, 0
+		}
+		githubBranches, resp, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
+			Page:    p.Page,
+			PerPage: perPage(p.PerPage),
+		})
+		if err != nil {
+			return nil, err, branchCooldown(resp, err)
+		}
+		branches := make([]string, 0, len(githubBranches))
+		for _, branch := range githubBranches {
+			branches = append(branches, branch.GetName())
+		}
+		return branches, nil, 0
 	})
-	if err != nil {
-		return nil, err
-	}
+}
 
-	branches := make([]string, 0)
-	for _, branch := range githubBranches {
-		branches = append(branches, *branch.Name)
+// branchCooldown backs off only on proven quota errors; ordinary permission
+// denials (403) are not cached or silently treated as rate limits.
+func branchCooldown(resp *github.Response, err error) time.Duration {
+	if resp == nil || resp.Response == nil {
+		return 0
 	}
-	return branches, nil
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+		return 0
+	}
+	if raw := resp.Header.Get("Retry-After"); raw != "" {
+		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && seconds >= 0 {
+			return time.Duration(seconds+1) * time.Second
+		}
+		if reset, parseErr := http.ParseTime(raw); parseErr == nil && time.Until(reset) > 0 {
+			return time.Until(reset) + time.Second
+		}
+	}
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		if reset, parseErr := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
+			if delay := time.Until(time.Unix(reset, 0)); delay > 0 {
+				return delay + time.Second
+			}
+		}
+		return time.Minute
+	}
+	if resp.StatusCode == http.StatusTooManyRequests || (err != nil && strings.Contains(strings.ToLower(err.Error()), "secondary rate limit")) {
+		return time.Minute
+	}
+	return 0
 }
 
 // BranchHead returns the sha of the head (latest commit) of the specified branch.
