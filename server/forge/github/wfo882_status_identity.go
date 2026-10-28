@@ -13,16 +13,16 @@ import (
 // The optional machine identity is statically assigned to these repositories.
 // It is never selected because another token returned HTTP 403 or 429.
 const (
-	wfo882Login            = "only50bw"
-	wfo882EnabledKey       = "WOODPECKER_WFO882_STATUS_IDENTITY_ENABLED"
-	wfo882OwnerKey         = "WOODPECKER_WFO882_OWNER_APPROVED"
-	wfo882ComplianceKey    = "WOODPECKER_WFO882_COMPLIANCE_APPROVED"
-	wfo882TokenFileKey     = "WOODPECKER_WFO882_TOKEN_FILE"
+	wfo882Login         = "only50bw"
+	wfo882EnabledKey    = "WOODPECKER_WFO882_STATUS_IDENTITY_ENABLED"
+	wfo882OwnerKey      = "WOODPECKER_WFO882_OWNER_APPROVED"
+	wfo882ComplianceKey = "WOODPECKER_WFO882_COMPLIANCE_APPROVED"
+	wfo882TokenFileKey  = "WOODPECKER_WFO882_TOKEN_FILE"
 )
 
 type wfo882StatusRoute struct {
-	token         string
-	once          sync.Once
+	token           string
+	once            sync.Once
 	verificationErr error
 }
 
