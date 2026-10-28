@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -64,6 +65,15 @@ type Opts struct {
 // New returns a Forge implementation that integrates with a GitHub Cloud or
 // GitHub Enterprise version control hosting provider.
 func New(id int64, opts Opts) (forge.Forge, error) {
+	statusRoute, err := wfo882LoadStatusRoute(os.Getenv, wfo882ReadProtectedToken)
+	if err != nil {
+		return nil, err
+	}
+	// A machine identity for github.com must never be routed to an arbitrary
+	// GitHub Enterprise server or a different API endpoint.
+	if statusRoute != nil && opts.URL != defaultURL {
+		return nil, errors.New("WFO882_CUSTOM_FORGE_NOT_ALLOWED")
+	}
 	r := &client{
 		id:         id,
 		API:        defaultAPI,
@@ -74,6 +84,7 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 		SkipVerify: opts.SkipVerify,
 		MergeRef:   opts.MergeRef,
 		OnlyPublic: opts.OnlyPublic,
+		wfo882:     statusRoute,
 	}
 	if opts.URL != defaultURL {
 		r.url = strings.TrimSuffix(opts.URL, "/")
@@ -93,6 +104,7 @@ type client struct {
 	MergeRef   bool
 	OnlyPublic bool
 	oAuthHost  string
+	wfo882     *wfo882StatusRoute
 }
 
 // Name returns the string name of this driver.
@@ -574,7 +586,34 @@ var reDeploy = regexp.MustCompile(`.+/deployments/(\d+)`)
 // Status sends the commit status to the forge.
 // An example would be the GitHub pull request status.
 func (c *client) Status(ctx context.Context, user *model.User, repo *model.Repo, pipeline *model.Pipeline, workflow *model.Workflow) error {
-	client, err := c.newClientToken(ctx, user.AccessToken)
+	token := user.AccessToken
+	requestCtx := ctx
+	if pipeline.Event != model.EventDeploy && c.wfo882 != nil &&
+		wfo882AllowedStatusRepository(repo.Owner, repo.Name) {
+		var err error
+		token, err = c.wfo882.selectToken(repo.Owner, repo.Name, token, func(machineToken string) error {
+			// Ignore context-injected clients: account verification and the
+			// subsequent status write must use the SAME machine credential.
+			identityCtx := context.WithValue(ctx, githubClientKey, nil)
+			verifier, err := c.newClientToken(identityCtx, machineToken)
+			if err != nil {
+				return err
+			}
+			identity, _, err := verifier.Users.Get(identityCtx, "")
+			if err != nil {
+				return err
+			}
+			if identity.GetLogin() != wfo882Login {
+				return errors.New("WFO882_LOGIN_MISMATCH")
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		requestCtx = context.WithValue(ctx, githubClientKey, nil)
+	}
+	client, err := c.newClientToken(requestCtx, token)
 	if err != nil {
 		return err
 	}
