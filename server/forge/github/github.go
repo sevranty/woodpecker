@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -64,6 +65,15 @@ type Opts struct {
 // New returns a Forge implementation that integrates with a GitHub Cloud or
 // GitHub Enterprise version control hosting provider.
 func New(id int64, opts Opts) (forge.Forge, error) {
+	statusRoute, err := wfo882LoadStatusRoute(os.Getenv, wfo882ReadProtectedToken)
+	if err != nil {
+		return nil, err
+	}
+	// A machine identity for github.com must never be routed to an arbitrary
+	// GitHub Enterprise server or a different API endpoint.
+	if statusRoute != nil && opts.URL != defaultURL {
+		return nil, errors.New("WFO882_CUSTOM_FORGE_NOT_ALLOWED")
+	}
 	r := &client{
 		id:         id,
 		API:        defaultAPI,
@@ -74,6 +84,7 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 		SkipVerify: opts.SkipVerify,
 		MergeRef:   opts.MergeRef,
 		OnlyPublic: opts.OnlyPublic,
+		wfo882:     statusRoute,
 	}
 	if opts.URL != defaultURL {
 		r.url = strings.TrimSuffix(opts.URL, "/")
@@ -84,15 +95,17 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 }
 
 type client struct {
-	id         int64
-	url        string
-	API        string
-	Client     string
-	Secret     string
-	SkipVerify bool
-	MergeRef   bool
-	OnlyPublic bool
-	oAuthHost  string
+	id            int64
+	url           string
+	API           string
+	Client        string
+	Secret        string
+	SkipVerify    bool
+	MergeRef      bool
+	OnlyPublic    bool
+	oAuthHost     string
+	wfo882        *wfo882StatusRoute
+	branchesCache branchCache
 }
 
 // Name returns the string name of this driver.
@@ -574,7 +587,34 @@ var reDeploy = regexp.MustCompile(`.+/deployments/(\d+)`)
 // Status sends the commit status to the forge.
 // An example would be the GitHub pull request status.
 func (c *client) Status(ctx context.Context, user *model.User, repo *model.Repo, pipeline *model.Pipeline, workflow *model.Workflow) error {
-	client, err := c.newClientToken(ctx, user.AccessToken)
+	token := user.AccessToken
+	requestCtx := ctx
+	if pipeline.Event != model.EventDeploy && c.wfo882 != nil &&
+		wfo882AllowedStatusRepository(repo.Owner, repo.Name) {
+		var err error
+		token, err = c.wfo882.selectToken(repo.Owner, repo.Name, token, func(machineToken string) error {
+			// Ignore context-injected clients: account verification and the
+			// subsequent status write must use the SAME machine credential.
+			identityCtx := context.WithValue(ctx, githubClientKey, nil)
+			verifier, err := c.newClientToken(identityCtx, machineToken)
+			if err != nil {
+				return err
+			}
+			identity, _, err := verifier.Users.Get(identityCtx, "")
+			if err != nil {
+				return err
+			}
+			if identity.GetLogin() != wfo882Login {
+				return errors.New("WFO882_LOGIN_MISMATCH")
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		requestCtx = context.WithValue(ctx, githubClientKey, nil)
+	}
+	client, err := c.newClientToken(requestCtx, token)
 	if err != nil {
 		return err
 	}
@@ -635,24 +675,63 @@ func (c *client) Activate(ctx context.Context, u *model.User, r *model.Repo, lin
 // Branches returns the names of all branches for the named repository.
 func (c *client) Branches(ctx context.Context, u *model.User, r *model.Repo, p *model.ListOptions) ([]string, error) {
 	token := common.UserToken(ctx, r, u)
-	client, err := c.newClientToken(ctx, token)
-	if err != nil {
-		return nil, err
-	}
-
-	githubBranches, _, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
-		Page:    p.Page,
-		PerPage: perPage(p.PerPage),
+	key := newBranchCacheKey(token, r.Owner, r.Name, p.Page, perPage(p.PerPage))
+	return c.branchesCache.get(ctx, key, func() ([]string, error, time.Duration) {
+		client, err := c.newClientToken(ctx, token)
+		if err != nil {
+			return nil, err, 0
+		}
+		githubBranches, resp, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
+			Page:    p.Page,
+			PerPage: perPage(p.PerPage),
+		})
+		if err != nil {
+			return nil, err, branchCooldown(resp, err)
+		}
+		branches := make([]string, 0, len(githubBranches))
+		for _, branch := range githubBranches {
+			branches = append(branches, branch.GetName())
+		}
+		return branches, nil, 0
 	})
-	if err != nil {
-		return nil, err
-	}
+}
 
-	branches := make([]string, 0)
-	for _, branch := range githubBranches {
-		branches = append(branches, *branch.Name)
+// branchCooldown backs off only on proven quota errors; ordinary permission
+// denials (403) are not cached or silently treated as rate limits.
+func branchCooldown(resp *github.Response, err error) time.Duration {
+	if resp == nil || resp.Response == nil {
+		return 0
 	}
-	return branches, nil
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+		return 0
+	}
+	var cooldown time.Duration
+	if raw := resp.Header.Get("Retry-After"); raw != "" {
+		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && seconds >= 0 && seconds < int64((1<<63-1)/int64(time.Second))-1 {
+			cooldown = time.Duration(seconds+1) * time.Second
+		} else if retryDate, parseErr := http.ParseTime(raw); parseErr == nil {
+			if delay := time.Until(retryDate); delay > 0 {
+				cooldown = delay + time.Second
+			}
+		}
+	}
+	// Primary reset and secondary Retry-After can appear together.
+	// Honor the later deadline so the cache never retries on an exhausted quota.
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		primaryDelay := time.Minute
+		if reset, parseErr := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
+			if delay := time.Until(time.Unix(reset, 0)); delay > 0 {
+				primaryDelay = delay + time.Second
+			}
+		}
+		if primaryDelay > cooldown {
+			cooldown = primaryDelay
+		}
+	}
+	if cooldown == 0 && (resp.StatusCode == http.StatusTooManyRequests || (err != nil && strings.Contains(strings.ToLower(err.Error()), "secondary rate limit"))) {
+		return time.Minute
+	}
+	return cooldown
 }
 
 // BranchHead returns the sha of the head (latest commit) of the specified branch.
