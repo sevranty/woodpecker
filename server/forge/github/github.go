@@ -84,7 +84,7 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 		SkipVerify: opts.SkipVerify,
 		MergeRef:   opts.MergeRef,
 		OnlyPublic: opts.OnlyPublic,
-		wfo882StatusRoute: statusRoute,
+		wfo882:     statusRoute,
 	}
 	if opts.URL != defaultURL {
 		r.url = strings.TrimSuffix(opts.URL, "/")
@@ -104,7 +104,7 @@ type client struct {
 	MergeRef   bool
 	OnlyPublic bool
 	oAuthHost  string
-	wfo882StatusRoute *wfo882StatusRoute
+	wfo882     *wfo882StatusRoute
 }
 
 // Name returns the string name of this driver.
@@ -588,10 +588,10 @@ var reDeploy = regexp.MustCompile(`.+/deployments/(\d+)`)
 func (c *client) Status(ctx context.Context, user *model.User, repo *model.Repo, pipeline *model.Pipeline, workflow *model.Workflow) error {
 	token := user.AccessToken
 	requestCtx := ctx
-	if pipeline.Event != model.EventDeploy && c.wfo882StatusRoute != nil &&
+	if pipeline.Event != model.EventDeploy && c.wfo882 != nil &&
 		wfo882AllowedStatusRepository(repo.Owner, repo.Name) {
 		var err error
-		token, err = c.wfo882StatusRoute.selectToken(repo.Owner, repo.Name, token, func(machineToken string) error {
+		token, err = c.wfo882.selectToken(repo.Owner, repo.Name, token, func(machineToken string) error {
 			// Ignore context-injected clients: account verification and the
 			// subsequent status write must use the SAME machine credential.
 			identityCtx := context.WithValue(ctx, githubClientKey, nil)
