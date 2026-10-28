@@ -178,7 +178,7 @@ func TestWFO882InvalidCredentialNeverReadFromProcessEnv(t *testing.T) {
 			func(k string) string { return flags[k] },
 			func(string) (string, error) { return token, nil },
 		)
-		if err == nil || strings.Contains(err.Error(), token) {
+		if err == nil || (token != "" && strings.Contains(err.Error(), token)) {
 			t.Fatalf("invalid token accepted or disclosed: %q", token)
 		}
 	}
