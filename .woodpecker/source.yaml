@@ -1,0 +1,21 @@
+when:
+  - event: push
+  - event: pull_request
+
+steps:
+  source-check:
+    image: docker.io/golang:1.27-bookworm
+    pull: false
+    commands:
+      - |
+        set -eu
+        go version
+        test -s go.mod
+        test -s server/forge/github/github.go
+        test -s server/forge/github/branch_cache.go
+        test -s server/forge/github/wfo882_status_identity.go
+        test ! -e .woodpecker/docker.yaml
+        test "$(find .woodpecker -maxdepth 1 -type f -name '*.yaml' | wc -l)" -eq 1
+        test -z "$(gofmt -l server/forge/github/github.go server/forge/github/branch_cache.go server/forge/github/branch_cache_test.go server/forge/github/github_branch_cache_integration_test.go server/forge/github/wfo882_status_identity.go server/forge/github/wfo882_status_identity_test.go)"
+        git diff --check
+        echo "WOODPECKER_SOURCE_ONLY_CHECK=PASS"

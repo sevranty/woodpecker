@@ -1,0 +1,74 @@
+name: WPCK exact Go 1.27 source gate
+
+on:
+  push:
+    branches:
+      - wpck-11-safe-source-gate-v319
+
+# Only test public source. No checkout action, GitHub token,
+# services, repository write permissions, secrets, deployments or publishing.
+permissions: {}
+
+jobs:
+  go-source:
+    name: Go source check - ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: wpck7-pr8
+            branch: wpck-7-wfo882-integrated-319
+            sha: c481e9c822a8daa53a480f97c95ef5d47a0248bf
+          - name: wpck9-pr10
+            branch: wpck-9-github-http-counters-v319
+            sha: 9fd1adcf37b61b3a1199ced84e99da297890738e
+    env:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: "2"
+    steps:
+      - name: Fetch and pin exact public source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q source
+          git -C source remote add origin https://github.com/sevranty/woodpecker.git
+          git -C source fetch -q --no-tags --depth=1 origin "refs/heads/${{ matrix.branch }}"
+          git -C source checkout -q --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "${{ matrix.sha }}"
+          test -z "$(git -C source status --porcelain)"
+          echo "Verified exact source: ${{ matrix.sha }}"
+
+      - name: Install verified official Go 1.27.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 2 --connect-timeout 15 \
+            https://go.dev/dl/go1.27.0.linux-amd64.tar.gz \
+            -o "$RUNNER_TEMP/go1.27.0.linux-amd64.tar.gz"
+          echo "675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685  $RUNNER_TEMP/go1.27.0.linux-amd64.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/official-go"
+          tar -xzf "$RUNNER_TEMP/go1.27.0.linux-amd64.tar.gz" -C "$RUNNER_TEMP/official-go"
+          "$RUNNER_TEMP/official-go/go/bin/go" version
+          echo "$RUNNER_TEMP/official-go/go/bin" >> "$GITHUB_PATH"
+
+      - name: Verify GitHub forge source, race and static analysis
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ matrix.sha }}"
+          go test -count=1 -p 2 -timeout=180s ./server/forge/github
+          go test -race -count=1 -p 2 -timeout=180s ./server/forge/github
+          go vet -p 2 ./server/forge/github
+          test -z "$(gofmt -l \
+            server/forge/github/github.go \
+            server/forge/github/branch_cache.go \
+            server/forge/github/branch_cache_test.go \
+            server/forge/github/github_branch_cache_integration_test.go \
+            server/forge/github/wfo882_status_identity.go \
+            server/forge/github/wfo882_status_identity_test.go)"
+          git diff --check
+          test -z "$(git status --porcelain)"
+          echo "PASS: independent hosted checks on exact ${{ matrix.sha }}"
