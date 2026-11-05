@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "canonical_source": "sevranty/woodpecker",
+  "baseline_version": "v3.19.0",
+  "baseline_sha": "9f5568c20a1f7195d23c4194c49d53bd2580be41",
+  "source_version_branch": "wpck-v3.19.0",
+  "source_sha": "3f6a236dba3981889103fe11a0b30e7522839120",
+  "upstream_target_version": "v3.20.1",
+  "upstream_target_sha": "3f1bb0bd0db28e410ad797034d75780116122c91",
+  "modules": [
+    {
+      "id": "github-branch-cache",
+      "owner_issue": "WPCK#1",
+      "source_from": "9f5568c20a1f7195d23c4194c49d53bd2580be41",
+      "source_to": "b07afb595cddda62fff6281059b25884f08270c9",
+      "patch_path": "maintenance/upgrade/patches/github-branch-cache.patch",
+      "patch_sha256": "5b351cf2721b3b6cf5973747e2544c83e1390f421e6d52cadf25b737d084c605",
+      "size_bytes": 18159,
+      "description": "Кеш успешных GET веток и объединение одновременных запросов",
+      "default_disabled": false,
+      "applicability": "requires review against each upstream release",
+      "status": "carry-forward-pending-upstream-3.20.1",
+      "tests": [
+        "go test ./server/forge/github",
+        "go test -race ./server/forge/github"
+      ],
+      "rollback": "remove module in source candidate and rebuild; never edit live config"
+    },
+    {
+      "id": "github-status-route",
+      "owner_issue": "WPCK#5",
+      "source_from": "b07afb595cddda62fff6281059b25884f08270c9",
+      "source_to": "c481e9c822a8daa53a480f97c95ef5d47a0248bf",
+      "patch_path": "maintenance/upgrade/patches/github-status-route.patch",
+      "patch_sha256": "c1db4facdd9a4e0731a1644f721940c2e64e7e02dea2286596d34dc8a61961ad",
+      "size_bytes": 12498,
+      "description": "Опциональная маршрутизация статусов GitHub, выключена по умолчанию",
+      "default_disabled": true,
+      "applicability": "requires review against each upstream release",
+      "status": "carry-forward-pending-upstream-3.20.1",
+      "tests": [
+        "go test ./server/forge/github"
+      ],
+      "rollback": "remove module in source candidate and rebuild; never edit live config"
+    },
+    {
+      "id": "github-http-metrics",
+      "owner_issue": "WPCK#9",
+      "source_from": "c481e9c822a8daa53a480f97c95ef5d47a0248bf",
+      "source_to": "9fd1adcf37b61b3a1199ced84e99da297890738e",
+      "patch_path": "maintenance/upgrade/patches/github-http-metrics.patch",
+      "patch_sha256": "221492581e3642306e28b39abed66c580f1ce82aaa27bde55ba734535bcab533",
+      "size_bytes": 11038,
+      "description": "Счётчики исходящих HTTP и ответов GitHub по обезличенным меткам",
+      "default_disabled": false,
+      "applicability": "requires review against each upstream release",
+      "status": "carry-forward-pending-upstream-3.20.1",
+      "tests": [
+        "go test ./server/forge/github"
+      ],
+      "rollback": "remove module in source candidate and rebuild; never edit live config"
+    },
+    {
+      "id": "source-ci",
+      "owner_issue": "WPCK#13",
+      "source_from": "9f5568c20a1f7195d23c4194c49d53bd2580be41",
+      "source_to": "3f6a236dba3981889103fe11a0b30e7522839120",
+      "patch_path": "maintenance/upgrade/patches/source-ci.patch",
+      "patch_sha256": "42a7d410f4a91c2104e726eab3ccd77729af92d41fded60d090d02442a0317ac",
+      "size_bytes": 9250,
+      "description": "Ограниченные непривилегированные проверки исходников и архив upstream конвейеров",
+      "default_disabled": false,
+      "applicability": "requires review against each upstream release",
+      "status": "carry-forward-pending-upstream-3.20.1",
+      "tests": [
+        "source-check",
+        "go test ./server/forge/github"
+      ],
+      "rollback": "remove module in source candidate and rebuild; never edit live config"
+    }
+  ],
+  "external_decisions": [
+    {
+      "id": "queue-recovery",
+      "issues": [
+        "WFO#770",
+        "WFO#773"
+      ],
+      "source": "https://github.com/sevranty/web-factory-os/issues/771",
+      "status": "not-in-wpck-v3.19.0-source",
+      "next": "prove upstream 3.20.1 queue semantics and decide exact port, do not claim present in current live binary"
+    },
+    {
+      "id": "ui-custom-assets",
+      "issues": [
+        "AEF#1223",
+        "WFO#771"
+      ],
+      "source": "https://github.com/sevranty/web-factory-os/issues/771",
+      "status": "external-runtime-config-not-in-source",
+      "next": "preserve WOODPECKER_CUSTOM_CSS_FILE and WOODPECKER_CUSTOM_JS_FILE paths and content hashes in SRV#863; no secrets or live reads"
+    }
+  ]
+}
