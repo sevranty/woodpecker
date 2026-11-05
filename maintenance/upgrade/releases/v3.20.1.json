@@ -28,18 +28,37 @@
   "external_queue_patch_state": "requires-upstream-compatibility-and-WFO-770-773-contract-validation",
   "custom_css_js_state": "external-check-required-SRV-863",
   "protected_runtime": "not-touched",
-  "source_checks": "go1.27.0 github/unit-race-vet-gofmt PASS; queue-scheduler-rpc unit PASS; full-server and authentic frontend PENDING",
-  "queue_security_gate": "BLOCKED until WFO#770/#773 custom lease retry semantics or explicit upstream equivalence verified; baseline 3.20.1 queue tests PASS",
+  "source_checks": "Go1.27 GitHub unit/race/vet/gofmt PASS; queue/scheduler/rpc PASS; pnpm frozen install and authentic Vite build PASS; Linux CGO0 server+agent build PASS; full server FAIL same source defect on official v3.20.1; custom queue bounded retries NOT PORTED.",
+  "queue_security_gate": "BLOCKED_WPCK#21; source independent negative tests for retry and DB migration not completed",
   "go_version": "go1.27.0",
   "source_tests": {
-    "github_unit": "PASS",
-    "github_race": "PASS",
-    "github_vet": "PASS",
-    "github_gofmt": "PASS",
-    "queue_unit": "PASS",
-    "scheduler_unit": "PASS",
-    "rpc_unit": "PASS",
-    "full_server": "PENDING",
-    "authentic_frontend": "PENDING"
+    "go_version": "go1.27.0",
+    "go_github_unit": "PASS",
+    "go_github_race": "PASS",
+    "go_github_vet": "PASS",
+    "go_github_gofmt": "PASS",
+    "go_queue_scheduler_rpc": "PASS",
+    "pnpm_frozen_lockfile_install": "PASS",
+    "web_vite_build": "PASS",
+    "linux_server_cgo0_with_authentic_web_dist": "PASS",
+    "linux_agent_cgo0": "PASS",
+    "server_full_suite": "FAIL_known_upstream_server_api_repo_test_undefined_helpers",
+    "source_ci_exact_head": "PASS_before_build_record_commit",
+    "queue_custom_bounded_lease_behavior": "BLOCKED_source_port_not_done",
+    "linux_server_cgo1_sqlite_parity": "NOT_TESTED",
+    "isolated_runtime_smoke": "NOT_TESTED"
+  },
+  "build_artifacts": {
+    "server_linux_amd64_cgo0_sha256": "d9e3ce1076b5d53cd61e1590be07453714b840ec9a93214d6538ab4206709275",
+    "agent_linux_amd64_cgo0_sha256": "fa5fef35e0e54c3b3cbe6736300f2b928a230bff74fb5d66438ba596ee2b005e",
+    "authentic_frontend": "web/dist/index.html produced by pnpm@12.15.0 + Vite",
+    "build_host": "Mac arm64 isolated temp toolchain and caches",
+    "production_parity": "NOT_PROVEN; CGO0 build is not equivalent to live CGO1/SQLite"
+  },
+  "full_suite_baseline": {
+    "package": "server/api",
+    "upstream_sha": "3f1bb0bd0db28e410ad797034d75780116122c91",
+    "result": "FAIL",
+    "observed": "server/api/repo_test.go undefined newTestStore/newTestContext/withUser/withRepo on exact pristine upstream version; same on candidate"
   }
 }
