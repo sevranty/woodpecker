@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "upstream_target_sha": "3f1bb0bd0db28e410ad797034d75780116122c91",
+  "checks": [
+    {
+      "source": "WFO-319-redispatch/upstream-pr7152-v3.19.0.patch",
+      "sha256": "65ddfa189619e4dc23c6c5cddee80d1975f20524447750bf298eb90ee620e4fa",
+      "status": "APPLIES_CLEANLY",
+      "errors": []
+    },
+    {
+      "source": "WFO-319-redispatch/rpc-lease-test-compat.patch",
+      "sha256": "fc7aa4eb9ed1cbc5a39767451f1d93891fa73d01d88336a15661ec092a20716e",
+      "status": "APPLIES_CLEANLY",
+      "errors": []
+    },
+    {
+      "source": "WFO-319-redispatch/wfo773-reset-steps-on-redispatch.patch",
+      "sha256": "762e74da4131f8b028d48a8e2dc29e64f747dd50a8644b24f06876b04a0b0ced",
+      "status": "APPLIES_CLEANLY",
+      "errors": []
+    },
+    {
+      "source": "WFO-319-redispatch/wfo773-bounded-retries.patch",
+      "sha256": "b66e8775627bf83d8bf96c03557f9422d0ec9cff10b4496ce832de7c8e38e599",
+      "status": "CONFLICT",
+      "errors": [
+        "error: patch failed: server/queue/persistent.go:27",
+        "error: server/queue/persistent.go: patch does not apply",
+        "error: server/queue/persistent_sqlite_test.go: No such file or directory"
+      ]
+    }
+  ],
+  "decision": "UNRESOLVED: 3 WFO patch --check clean yet not applied; fourth bounded retry patch conflicts, requiring owned port and regression tests. Do not deploy.",
+  "source": "https://github.com/sevranty/web-factory-os/issues/771",
+  "exact_upstream_queue_suite": "PASS on Mac with Go 1.27.0: ./server/queue ./server/scheduler ./server/rpc"
+}

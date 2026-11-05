@@ -28,5 +28,18 @@
   "external_queue_patch_state": "requires-upstream-compatibility-and-WFO-770-773-contract-validation",
   "custom_css_js_state": "external-check-required-SRV-863",
   "protected_runtime": "not-touched",
-  "source_checks": "pending-exact-head"
+  "source_checks": "go1.27.0 github/unit-race-vet-gofmt PASS; queue-scheduler-rpc unit PASS; full-server and authentic frontend PENDING",
+  "queue_security_gate": "BLOCKED until WFO#770/#773 custom lease retry semantics or explicit upstream equivalence verified; baseline 3.20.1 queue tests PASS",
+  "go_version": "go1.27.0",
+  "source_tests": {
+    "github_unit": "PASS",
+    "github_race": "PASS",
+    "github_vet": "PASS",
+    "github_gofmt": "PASS",
+    "queue_unit": "PASS",
+    "scheduler_unit": "PASS",
+    "rpc_unit": "PASS",
+    "full_server": "PENDING",
+    "authentic_frontend": "PENDING"
+  }
 }
