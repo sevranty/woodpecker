@@ -17,17 +17,22 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v92/github"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
 
@@ -40,6 +45,145 @@ import (
 	"go.woodpecker-ci.org/woodpecker/v3/shared/httputil"
 	"go.woodpecker-ci.org/woodpecker/v3/shared/utils"
 )
+
+// GitHub HTTP measurements use the existing protected Prometheus endpoint.
+// Identity labels are process-local ordinal aliases, never tokens, token
+// digests, repository names, request URLs, or other sensitive identifiers.
+// Aliases reset after a restart; comparing a window across restarts requires
+// a separate source identity and must not be inferred from the ordinal.
+const maxGitHubMetricIdentities = 256
+
+var (
+	githubHTTPRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "woodpecker",
+		Subsystem: "github",
+		Name:      "outbound_requests_total",
+		Help:      "Actual outgoing GitHub forge HTTP requests, including failures; not cache lookups.",
+	}, []string{"identity", "method", "endpoint", "status"})
+
+	githubHTTPQuota = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "woodpecker",
+		Subsystem: "github",
+		Name:      "rate_limit",
+		Help:      "Latest GitHub rate-limit response headers for this process-local identity.",
+	}, []string{"identity", "resource", "field"})
+
+	githubMetricIdentities = struct {
+		sync.Mutex
+		aliases map[[32]byte]string
+	}{
+		aliases: make(map[[32]byte]string),
+	}
+)
+
+// githubMetricIdentity is bounded and contains no externally usable credential
+// identifier. The overflow series cannot be attributed to a single identity.
+func githubMetricIdentity(token string) string {
+	if token == "" {
+		return "anonymous"
+	}
+	digest := sha256.Sum256([]byte(token))
+	githubMetricIdentities.Lock()
+	defer githubMetricIdentities.Unlock()
+	if alias, ok := githubMetricIdentities.aliases[digest]; ok {
+		return alias
+	}
+	if len(githubMetricIdentities.aliases) >= maxGitHubMetricIdentities {
+		return "overflow"
+	}
+	alias := "identity_" + strconv.Itoa(len(githubMetricIdentities.aliases)+1)
+	githubMetricIdentities.aliases[digest] = alias
+	return alias
+}
+
+// Only fixed endpoint categories are exposed, never repo names or SHA values.
+func githubMetricEndpoint(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/branches"), strings.Contains(path, "/branches/"):
+		return "branches"
+	case strings.HasSuffix(path, "/statuses"), strings.Contains(path, "/statuses/"):
+		return "statuses"
+	case strings.HasSuffix(path, "/hooks"), strings.Contains(path, "/hooks/"):
+		return "hooks"
+	case strings.HasSuffix(path, "/deployments"), strings.Contains(path, "/deployments/"):
+		return "deployments"
+	case strings.HasPrefix(path, "/repos/"):
+		return "repositories_other"
+	case strings.HasPrefix(path, "/users/"), path == "/user", strings.HasPrefix(path, "/user/"):
+		return "users"
+	case strings.HasPrefix(path, "/orgs/"):
+		return "organizations"
+	default:
+		return "other"
+	}
+}
+
+func githubMetricMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return method
+	default:
+		return "other"
+	}
+}
+
+func githubMetricResource(header string) string {
+	switch header {
+	case "core", "search", "graphql", "code_search", "integration_manifest":
+		return header
+	default:
+		return "other"
+	}
+}
+
+// The wrapper counts a real RoundTrip rather than a cache hit or logical
+// operation; the upstream response and error are returned without mutation.
+type githubMetricsRoundTripper struct {
+	base     http.RoundTripper
+	identity string
+}
+
+func (t githubMetricsRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	status := "transport_error"
+	if response != nil {
+		status = strconv.Itoa(response.StatusCode)
+		resource := githubMetricResource(response.Header.Get("X-RateLimit-Resource"))
+		for _, field := range [...]struct{ label, header string }{
+			{"limit", "X-RateLimit-Limit"},
+			{"remaining", "X-RateLimit-Remaining"},
+			{"used", "X-RateLimit-Used"},
+			{"reset", "X-RateLimit-Reset"},
+		} {
+			if value, parseErr := strconv.ParseInt(response.Header.Get(field.header), 10, 64); parseErr == nil && value >= 0 {
+				githubHTTPQuota.WithLabelValues(t.identity, resource, field.label).Set(float64(value))
+			}
+		}
+	}
+	method := githubMetricMethod(request.Method)
+	endpoint := githubMetricEndpoint(request.URL.Path)
+	githubHTTPRequests.WithLabelValues(t.identity, method, endpoint, status).Inc()
+
+	// One bounded, non-secret journal record per actual HTTP RoundTrip.
+	// Unlike Prometheus scraping, this works without any new credential or
+	// changes to the existing protected /metrics configuration.
+	event := log.Info().
+		Str("component", "github_outbound_http").
+		Str("identity", t.identity).
+		Str("method", method).
+		Str("endpoint", endpoint).
+		Str("status", status)
+	if response != nil {
+		if remaining, parseErr := strconv.ParseInt(response.Header.Get("X-RateLimit-Remaining"), 10, 64); parseErr == nil && remaining >= 0 {
+			event = event.Int64("quota_remaining", remaining)
+		}
+		if used, parseErr := strconv.ParseInt(response.Header.Get("X-RateLimit-Used"), 10, 64); parseErr == nil && used >= 0 {
+			event = event.Int64("quota_used", used)
+		}
+	}
+	event.Msg("outbound GitHub HTTP request")
+	return response, err
+}
 
 type contextKey string
 
@@ -64,6 +208,15 @@ type Opts struct {
 // New returns a Forge implementation that integrates with a GitHub Cloud or
 // GitHub Enterprise version control hosting provider.
 func New(id int64, opts Opts) (forge.Forge, error) {
+	statusRoute, err := wfo882LoadStatusRoute(os.Getenv, wfo882ReadProtectedToken)
+	if err != nil {
+		return nil, err
+	}
+	// A machine identity for github.com must never be routed to an arbitrary
+	// GitHub Enterprise server or a different API endpoint.
+	if statusRoute != nil && opts.URL != defaultURL {
+		return nil, errors.New("WFO882_CUSTOM_FORGE_NOT_ALLOWED")
+	}
 	r := &client{
 		id:         id,
 		API:        defaultAPI,
@@ -74,6 +227,7 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 		SkipVerify: opts.SkipVerify,
 		MergeRef:   opts.MergeRef,
 		OnlyPublic: opts.OnlyPublic,
+		wfo882:     statusRoute,
 	}
 	if opts.URL != defaultURL {
 		r.url = strings.TrimSuffix(opts.URL, "/")
@@ -84,15 +238,17 @@ func New(id int64, opts Opts) (forge.Forge, error) {
 }
 
 type client struct {
-	id         int64
-	url        string
-	API        string
-	Client     string
-	Secret     string
-	SkipVerify bool
-	MergeRef   bool
-	OnlyPublic bool
-	oAuthHost  string
+	id            int64
+	url           string
+	API           string
+	Client        string
+	Secret        string
+	SkipVerify    bool
+	MergeRef      bool
+	OnlyPublic    bool
+	oAuthHost     string
+	wfo882        *wfo882StatusRoute
+	branchesCache branchCache
 }
 
 // Name returns the string name of this driver.
@@ -528,7 +684,10 @@ func (c *client) newClientToken(ctx context.Context, token string) (*github.Clie
 	}
 
 	// Wrap the base transport with User-Agent support
-	tp.Base = httputil.NewUserAgentRoundTripper(baseTransport, "forge-github")
+	tp.Base = githubMetricsRoundTripper{
+		base:     httputil.NewUserAgentRoundTripper(baseTransport, "forge-github"),
+		identity: githubMetricIdentity(token),
+	}
 
 	return github.NewClient(github.WithURLs(new(c.API), nil), github.WithHTTPClient(tc))
 }
@@ -574,7 +733,34 @@ var reDeploy = regexp.MustCompile(`.+/deployments/(\d+)`)
 // Status sends the commit status to the forge.
 // An example would be the GitHub pull request status.
 func (c *client) Status(ctx context.Context, user *model.User, repo *model.Repo, pipeline *model.Pipeline, workflow *model.Workflow) error {
-	client, err := c.newClientToken(ctx, user.AccessToken)
+	token := user.AccessToken
+	requestCtx := ctx
+	if pipeline.Event != model.EventDeploy && c.wfo882 != nil &&
+		wfo882AllowedStatusRepository(repo.Owner, repo.Name) {
+		var err error
+		token, err = c.wfo882.selectToken(repo.Owner, repo.Name, token, func(machineToken string) error {
+			// Ignore context-injected clients: account verification and the
+			// subsequent status write must use the SAME machine credential.
+			identityCtx := context.WithValue(ctx, githubClientKey, nil)
+			verifier, err := c.newClientToken(identityCtx, machineToken)
+			if err != nil {
+				return err
+			}
+			identity, _, err := verifier.Users.Get(identityCtx, "")
+			if err != nil {
+				return err
+			}
+			if identity.GetLogin() != wfo882Login {
+				return errors.New("WFO882_LOGIN_MISMATCH")
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		requestCtx = context.WithValue(ctx, githubClientKey, nil)
+	}
+	client, err := c.newClientToken(requestCtx, token)
 	if err != nil {
 		return err
 	}
@@ -635,24 +821,63 @@ func (c *client) Activate(ctx context.Context, u *model.User, r *model.Repo, lin
 // Branches returns the names of all branches for the named repository.
 func (c *client) Branches(ctx context.Context, u *model.User, r *model.Repo, p *model.ListOptions) ([]string, error) {
 	token := common.UserToken(ctx, r, u)
-	client, err := c.newClientToken(ctx, token)
-	if err != nil {
-		return nil, err
-	}
-
-	githubBranches, _, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
-		Page:    p.Page,
-		PerPage: perPage(p.PerPage),
+	key := newBranchCacheKey(token, r.Owner, r.Name, p.Page, perPage(p.PerPage))
+	return c.branchesCache.get(ctx, key, func() ([]string, error, time.Duration) {
+		client, err := c.newClientToken(ctx, token)
+		if err != nil {
+			return nil, err, 0
+		}
+		githubBranches, resp, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
+			Page:    p.Page,
+			PerPage: perPage(p.PerPage),
+		})
+		if err != nil {
+			return nil, err, branchCooldown(resp, err)
+		}
+		branches := make([]string, 0, len(githubBranches))
+		for _, branch := range githubBranches {
+			branches = append(branches, branch.GetName())
+		}
+		return branches, nil, 0
 	})
-	if err != nil {
-		return nil, err
-	}
+}
 
-	branches := make([]string, 0)
-	for _, branch := range githubBranches {
-		branches = append(branches, *branch.Name)
+// branchCooldown backs off only on proven quota errors; ordinary permission
+// denials (403) are not cached or silently treated as rate limits.
+func branchCooldown(resp *github.Response, err error) time.Duration {
+	if resp == nil || resp.Response == nil {
+		return 0
 	}
-	return branches, nil
+	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+		return 0
+	}
+	var cooldown time.Duration
+	if raw := resp.Header.Get("Retry-After"); raw != "" {
+		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && seconds >= 0 && seconds < int64((1<<63-1)/int64(time.Second))-1 {
+			cooldown = time.Duration(seconds+1) * time.Second
+		} else if retryDate, parseErr := http.ParseTime(raw); parseErr == nil {
+			if delay := time.Until(retryDate); delay > 0 {
+				cooldown = delay + time.Second
+			}
+		}
+	}
+	// Primary reset and secondary Retry-After can appear together.
+	// Honor the later deadline so the cache never retries on an exhausted quota.
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		primaryDelay := time.Minute
+		if reset, parseErr := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
+			if delay := time.Until(time.Unix(reset, 0)); delay > 0 {
+				primaryDelay = delay + time.Second
+			}
+		}
+		if primaryDelay > cooldown {
+			cooldown = primaryDelay
+		}
+	}
+	if cooldown == 0 && (resp.StatusCode == http.StatusTooManyRequests || (err != nil && strings.Contains(strings.ToLower(err.Error()), "secondary rate limit"))) {
+		return time.Minute
+	}
+	return cooldown
 }
 
 // BranchHead returns the sha of the head (latest commit) of the specified branch.
