@@ -17,6 +17,7 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -26,9 +27,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v92/github"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/oauth2"
 
@@ -41,6 +45,145 @@ import (
 	"go.woodpecker-ci.org/woodpecker/v3/shared/httputil"
 	"go.woodpecker-ci.org/woodpecker/v3/shared/utils"
 )
+
+// GitHub HTTP measurements use the existing protected Prometheus endpoint.
+// Identity labels are process-local ordinal aliases, never tokens, token
+// digests, repository names, request URLs, or other sensitive identifiers.
+// Aliases reset after a restart; comparing a window across restarts requires
+// a separate source identity and must not be inferred from the ordinal.
+const maxGitHubMetricIdentities = 256
+
+var (
+	githubHTTPRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "woodpecker",
+		Subsystem: "github",
+		Name:      "outbound_requests_total",
+		Help:      "Actual outgoing GitHub forge HTTP requests, including failures; not cache lookups.",
+	}, []string{"identity", "method", "endpoint", "status"})
+
+	githubHTTPQuota = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "woodpecker",
+		Subsystem: "github",
+		Name:      "rate_limit",
+		Help:      "Latest GitHub rate-limit response headers for this process-local identity.",
+	}, []string{"identity", "resource", "field"})
+
+	githubMetricIdentities = struct {
+		sync.Mutex
+		aliases map[[32]byte]string
+	}{
+		aliases: make(map[[32]byte]string),
+	}
+)
+
+// githubMetricIdentity is bounded and contains no externally usable credential
+// identifier. The overflow series cannot be attributed to a single identity.
+func githubMetricIdentity(token string) string {
+	if token == "" {
+		return "anonymous"
+	}
+	digest := sha256.Sum256([]byte(token))
+	githubMetricIdentities.Lock()
+	defer githubMetricIdentities.Unlock()
+	if alias, ok := githubMetricIdentities.aliases[digest]; ok {
+		return alias
+	}
+	if len(githubMetricIdentities.aliases) >= maxGitHubMetricIdentities {
+		return "overflow"
+	}
+	alias := "identity_" + strconv.Itoa(len(githubMetricIdentities.aliases)+1)
+	githubMetricIdentities.aliases[digest] = alias
+	return alias
+}
+
+// Only fixed endpoint categories are exposed, never repo names or SHA values.
+func githubMetricEndpoint(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/branches"), strings.Contains(path, "/branches/"):
+		return "branches"
+	case strings.HasSuffix(path, "/statuses"), strings.Contains(path, "/statuses/"):
+		return "statuses"
+	case strings.HasSuffix(path, "/hooks"), strings.Contains(path, "/hooks/"):
+		return "hooks"
+	case strings.HasSuffix(path, "/deployments"), strings.Contains(path, "/deployments/"):
+		return "deployments"
+	case strings.HasPrefix(path, "/repos/"):
+		return "repositories_other"
+	case strings.HasPrefix(path, "/users/"), path == "/user", strings.HasPrefix(path, "/user/"):
+		return "users"
+	case strings.HasPrefix(path, "/orgs/"):
+		return "organizations"
+	default:
+		return "other"
+	}
+}
+
+func githubMetricMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return method
+	default:
+		return "other"
+	}
+}
+
+func githubMetricResource(header string) string {
+	switch header {
+	case "core", "search", "graphql", "code_search", "integration_manifest":
+		return header
+	default:
+		return "other"
+	}
+}
+
+// The wrapper counts a real RoundTrip rather than a cache hit or logical
+// operation; the upstream response and error are returned without mutation.
+type githubMetricsRoundTripper struct {
+	base     http.RoundTripper
+	identity string
+}
+
+func (t githubMetricsRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.base.RoundTrip(request)
+	status := "transport_error"
+	if response != nil {
+		status = strconv.Itoa(response.StatusCode)
+		resource := githubMetricResource(response.Header.Get("X-RateLimit-Resource"))
+		for _, field := range [...]struct{ label, header string }{
+			{"limit", "X-RateLimit-Limit"},
+			{"remaining", "X-RateLimit-Remaining"},
+			{"used", "X-RateLimit-Used"},
+			{"reset", "X-RateLimit-Reset"},
+		} {
+			if value, parseErr := strconv.ParseInt(response.Header.Get(field.header), 10, 64); parseErr == nil && value >= 0 {
+				githubHTTPQuota.WithLabelValues(t.identity, resource, field.label).Set(float64(value))
+			}
+		}
+	}
+	method := githubMetricMethod(request.Method)
+	endpoint := githubMetricEndpoint(request.URL.Path)
+	githubHTTPRequests.WithLabelValues(t.identity, method, endpoint, status).Inc()
+
+	// One bounded, non-secret journal record per actual HTTP RoundTrip.
+	// Unlike Prometheus scraping, this works without any new credential or
+	// changes to the existing protected /metrics configuration.
+	event := log.Info().
+		Str("component", "github_outbound_http").
+		Str("identity", t.identity).
+		Str("method", method).
+		Str("endpoint", endpoint).
+		Str("status", status)
+	if response != nil {
+		if remaining, parseErr := strconv.ParseInt(response.Header.Get("X-RateLimit-Remaining"), 10, 64); parseErr == nil && remaining >= 0 {
+			event = event.Int64("quota_remaining", remaining)
+		}
+		if used, parseErr := strconv.ParseInt(response.Header.Get("X-RateLimit-Used"), 10, 64); parseErr == nil && used >= 0 {
+			event = event.Int64("quota_used", used)
+		}
+	}
+	event.Msg("outbound GitHub HTTP request")
+	return response, err
+}
 
 type contextKey string
 
@@ -541,7 +684,10 @@ func (c *client) newClientToken(ctx context.Context, token string) (*github.Clie
 	}
 
 	// Wrap the base transport with User-Agent support
-	tp.Base = httputil.NewUserAgentRoundTripper(baseTransport, "forge-github")
+	tp.Base = githubMetricsRoundTripper{
+		base:     httputil.NewUserAgentRoundTripper(baseTransport, "forge-github"),
+		identity: githubMetricIdentity(token),
+	}
 
 	return github.NewClient(github.WithURLs(new(c.API), nil), github.WithHTTPClient(tc))
 }

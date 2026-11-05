@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/go-github/v92/github"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.woodpecker-ci.org/woodpecker/v3/server/model"
 )
 
@@ -143,5 +144,96 @@ func TestGitHubBranchCooldownWaitsForBothHeaders(t *testing.T) {
 	permission := &github.Response{Response: &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header)}}
 	if got := branchCooldown(permission, fmt.Errorf("permission denied")); got != 0 {
 		t.Fatalf("ordinary permission 403 was incorrectly delayed: %s", got)
+	}
+}
+
+func TestGitHubOutboundMetricsCountActualHTTP(t *testing.T) {
+	var actualRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		actualRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-RateLimit-Resource", "core")
+		w.Header().Set("X-RateLimit-Limit", "5000")
+		w.Header().Set("X-RateLimit-Used", "9")
+		if r.URL.Path == "/repos/octocat/denied/branches" {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = fmt.Fprint(w, `{"message":"rate limit exceeded"}`)
+			return
+		}
+		w.Header().Set("X-RateLimit-Remaining", "4991")
+		switch {
+		case r.URL.Path == "/repos/octocat/repo/branches" && r.Method == http.MethodGet:
+			_, _ = fmt.Fprint(w, `[{"name":"main"}]`)
+		case r.URL.Path == "/repos/octocat/repo/statuses/abc123" && r.Method == http.MethodPost:
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprint(w, `{"id":1,"state":"success"}`)
+		default:
+			t.Errorf("unexpected endpoint or method: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	forge := &client{API: upstream.URL + "/"}
+	ctx := context.Background()
+	tokenA := "test-only-credential-A"
+	tokenB := "test-only-credential-B"
+	aliasA := githubMetricIdentity(tokenA)
+	aliasB := githubMetricIdentity(tokenB)
+	if aliasA == aliasB || aliasA == tokenA || aliasB == tokenB || aliasA == "overflow" || aliasB == "overflow" {
+		t.Fatalf("credential metrics alias is not distinct and protected: %q, %q", aliasA, aliasB)
+	}
+	apiA, err := forge.newClientToken(ctx, tokenA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiB, err := forge.newClientToken(ctx, tokenB)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	beforeGet := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "GET", "branches", "200"))
+	beforePost := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "POST", "statuses", "201"))
+	before403 := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasB, "GET", "branches", "403"))
+
+	// Two real HTTP GETs from the same credential have two RoundTrips.
+	for range 2 {
+		branches, _, callErr := apiA.Repositories.ListBranches(ctx, "octocat", "repo", &github.BranchListOptions{Page: 1})
+		if callErr != nil || len(branches) != 1 || branches[0].GetName() != "main" {
+			t.Fatalf("unexpected branch fetch: %v / %v", branches, callErr)
+		}
+	}
+	_, _, err = apiA.Repositories.CreateStatus(ctx, "octocat", "repo", "abc123", github.RepoStatus{
+		State: new("success"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = apiB.Repositories.ListBranches(ctx, "octocat", "denied", &github.BranchListOptions{Page: 1})
+	if err == nil {
+		t.Fatal("rate-limited upstream response must remain an error")
+	}
+
+	if got := actualRequests.Load(); got != 4 {
+		t.Fatalf("expected 4 real upstream requests, got %d", got)
+	}
+	if got := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "GET", "branches", "200")) - beforeGet; got != 2 {
+		t.Fatalf("GET counter=%v, expected 2", got)
+	}
+	if got := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "POST", "statuses", "201")) - beforePost; got != 1 {
+		t.Fatalf("POST status counter=%v, expected 1", got)
+	}
+	if got := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasB, "GET", "branches", "403")) - before403; got != 1 {
+		t.Fatalf("403 counter=%v, expected 1", got)
+	}
+	if remaining := testutil.ToFloat64(githubHTTPQuota.WithLabelValues(aliasB, "core", "remaining")); remaining != 0 {
+		t.Fatalf("quota remaining=%v, expected 0", remaining)
+	}
+	if used := testutil.ToFloat64(githubHTTPQuota.WithLabelValues(aliasA, "core", "used")); used != 9 {
+		t.Fatalf("quota used=%v, expected 9", used)
+	}
+	if got := githubMetricEndpoint("/repos/private-owner/secret-repo/statuses/secret-sha"); got != "statuses" {
+		t.Fatalf("endpoint classification exposes raw details: %q", got)
 	}
 }
