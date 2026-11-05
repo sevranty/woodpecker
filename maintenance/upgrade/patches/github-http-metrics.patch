@@ -1,0 +1,290 @@
+diff --git a/server/forge/github/github.go b/server/forge/github/github.go
+index 84e16d1..ac9f013 100644
+--- a/server/forge/github/github.go
++++ b/server/forge/github/github.go
+@@ -17,6 +17,7 @@ package github
+ 
+ import (
+ 	"context"
++	"crypto/sha256"
+ 	"crypto/tls"
+ 	"errors"
+ 	"fmt"
+@@ -26,9 +27,12 @@ import (
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/google/go-github/v92/github"
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/prometheus/client_golang/prometheus/promauto"
+ 	"github.com/rs/zerolog/log"
+ 	"golang.org/x/oauth2"
+ 
+@@ -42,6 +46,145 @@ import (
+ 	"go.woodpecker-ci.org/woodpecker/v3/shared/utils"
+ )
+ 
++// GitHub HTTP measurements use the existing protected Prometheus endpoint.
++// Identity labels are process-local ordinal aliases, never tokens, token
++// digests, repository names, request URLs, or other sensitive identifiers.
++// Aliases reset after a restart; comparing a window across restarts requires
++// a separate source identity and must not be inferred from the ordinal.
++const maxGitHubMetricIdentities = 256
++
++var (
++	githubHTTPRequests = promauto.NewCounterVec(prometheus.CounterOpts{
++		Namespace: "woodpecker",
++		Subsystem: "github",
++		Name:      "outbound_requests_total",
++		Help:      "Actual outgoing GitHub forge HTTP requests, including failures; not cache lookups.",
++	}, []string{"identity", "method", "endpoint", "status"})
++
++	githubHTTPQuota = promauto.NewGaugeVec(prometheus.GaugeOpts{
++		Namespace: "woodpecker",
++		Subsystem: "github",
++		Name:      "rate_limit",
++		Help:      "Latest GitHub rate-limit response headers for this process-local identity.",
++	}, []string{"identity", "resource", "field"})
++
++	githubMetricIdentities = struct {
++		sync.Mutex
++		aliases map[[32]byte]string
++	}{
++		aliases: make(map[[32]byte]string),
++	}
++)
++
++// githubMetricIdentity is bounded and contains no externally usable credential
++// identifier. The overflow series cannot be attributed to a single identity.
++func githubMetricIdentity(token string) string {
++	if token == "" {
++		return "anonymous"
++	}
++	digest := sha256.Sum256([]byte(token))
++	githubMetricIdentities.Lock()
++	defer githubMetricIdentities.Unlock()
++	if alias, ok := githubMetricIdentities.aliases[digest]; ok {
++		return alias
++	}
++	if len(githubMetricIdentities.aliases) >= maxGitHubMetricIdentities {
++		return "overflow"
++	}
++	alias := "identity_" + strconv.Itoa(len(githubMetricIdentities.aliases)+1)
++	githubMetricIdentities.aliases[digest] = alias
++	return alias
++}
++
++// Only fixed endpoint categories are exposed, never repo names or SHA values.
++func githubMetricEndpoint(path string) string {
++	switch {
++	case strings.HasSuffix(path, "/branches"), strings.Contains(path, "/branches/"):
++		return "branches"
++	case strings.HasSuffix(path, "/statuses"), strings.Contains(path, "/statuses/"):
++		return "statuses"
++	case strings.HasSuffix(path, "/hooks"), strings.Contains(path, "/hooks/"):
++		return "hooks"
++	case strings.HasSuffix(path, "/deployments"), strings.Contains(path, "/deployments/"):
++		return "deployments"
++	case strings.HasPrefix(path, "/repos/"):
++		return "repositories_other"
++	case strings.HasPrefix(path, "/users/"), path == "/user", strings.HasPrefix(path, "/user/"):
++		return "users"
++	case strings.HasPrefix(path, "/orgs/"):
++		return "organizations"
++	default:
++		return "other"
++	}
++}
++
++func githubMetricMethod(method string) string {
++	switch method {
++	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
++		return method
++	default:
++		return "other"
++	}
++}
++
++func githubMetricResource(header string) string {
++	switch header {
++	case "core", "search", "graphql", "code_search", "integration_manifest":
++		return header
++	default:
++		return "other"
++	}
++}
++
++// The wrapper counts a real RoundTrip rather than a cache hit or logical
++// operation; the upstream response and error are returned without mutation.
++type githubMetricsRoundTripper struct {
++	base     http.RoundTripper
++	identity string
++}
++
++func (t githubMetricsRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
++	response, err := t.base.RoundTrip(request)
++	status := "transport_error"
++	if response != nil {
++		status = strconv.Itoa(response.StatusCode)
++		resource := githubMetricResource(response.Header.Get("X-RateLimit-Resource"))
++		for _, field := range [...]struct{ label, header string }{
++			{"limit", "X-RateLimit-Limit"},
++			{"remaining", "X-RateLimit-Remaining"},
++			{"used", "X-RateLimit-Used"},
++			{"reset", "X-RateLimit-Reset"},
++		} {
++			if value, parseErr := strconv.ParseInt(response.Header.Get(field.header), 10, 64); parseErr == nil && value >= 0 {
++				githubHTTPQuota.WithLabelValues(t.identity, resource, field.label).Set(float64(value))
++			}
++		}
++	}
++	method := githubMetricMethod(request.Method)
++	endpoint := githubMetricEndpoint(request.URL.Path)
++	githubHTTPRequests.WithLabelValues(t.identity, method, endpoint, status).Inc()
++
++	// One bounded, non-secret journal record per actual HTTP RoundTrip.
++	// Unlike Prometheus scraping, this works without any new credential or
++	// changes to the existing protected /metrics configuration.
++	event := log.Info().
++		Str("component", "github_outbound_http").
++		Str("identity", t.identity).
++		Str("method", method).
++		Str("endpoint", endpoint).
++		Str("status", status)
++	if response != nil {
++		if remaining, parseErr := strconv.ParseInt(response.Header.Get("X-RateLimit-Remaining"), 10, 64); parseErr == nil && remaining >= 0 {
++			event = event.Int64("quota_remaining", remaining)
++		}
++		if used, parseErr := strconv.ParseInt(response.Header.Get("X-RateLimit-Used"), 10, 64); parseErr == nil && used >= 0 {
++			event = event.Int64("quota_used", used)
++		}
++	}
++	event.Msg("outbound GitHub HTTP request")
++	return response, err
++}
++
+ type contextKey string
+ 
+ const (
+@@ -541,7 +684,10 @@ func (c *client) newClientToken(ctx context.Context, token string) (*github.Clie
+ 	}
+ 
+ 	// Wrap the base transport with User-Agent support
+-	tp.Base = httputil.NewUserAgentRoundTripper(baseTransport, "forge-github")
++	tp.Base = githubMetricsRoundTripper{
++		base:     httputil.NewUserAgentRoundTripper(baseTransport, "forge-github"),
++		identity: githubMetricIdentity(token),
++	}
+ 
+ 	return github.NewClient(github.WithURLs(new(c.API), nil), github.WithHTTPClient(tc))
+ }
+diff --git a/server/forge/github/github_branch_cache_integration_test.go b/server/forge/github/github_branch_cache_integration_test.go
+index 4d1dfef..13f2395 100644
+--- a/server/forge/github/github_branch_cache_integration_test.go
++++ b/server/forge/github/github_branch_cache_integration_test.go
+@@ -13,6 +13,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/google/go-github/v92/github"
++	"github.com/prometheus/client_golang/prometheus/testutil"
+ 	"go.woodpecker-ci.org/woodpecker/v3/server/model"
+ )
+ 
+@@ -145,3 +146,94 @@ func TestGitHubBranchCooldownWaitsForBothHeaders(t *testing.T) {
+ 		t.Fatalf("ordinary permission 403 was incorrectly delayed: %s", got)
+ 	}
+ }
++
++func TestGitHubOutboundMetricsCountActualHTTP(t *testing.T) {
++	var actualRequests atomic.Int32
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		actualRequests.Add(1)
++		w.Header().Set("Content-Type", "application/json")
++		w.Header().Set("X-RateLimit-Resource", "core")
++		w.Header().Set("X-RateLimit-Limit", "5000")
++		w.Header().Set("X-RateLimit-Used", "9")
++		if r.URL.Path == "/repos/octocat/denied/branches" {
++			w.Header().Set("X-RateLimit-Remaining", "0")
++			w.WriteHeader(http.StatusForbidden)
++			_, _ = fmt.Fprint(w, `{"message":"rate limit exceeded"}`)
++			return
++		}
++		w.Header().Set("X-RateLimit-Remaining", "4991")
++		switch {
++		case r.URL.Path == "/repos/octocat/repo/branches" && r.Method == http.MethodGet:
++			_, _ = fmt.Fprint(w, `[{"name":"main"}]`)
++		case r.URL.Path == "/repos/octocat/repo/statuses/abc123" && r.Method == http.MethodPost:
++			w.WriteHeader(http.StatusCreated)
++			_, _ = fmt.Fprint(w, `{"id":1,"state":"success"}`)
++		default:
++			t.Errorf("unexpected endpoint or method: %s %s", r.Method, r.URL.Path)
++			w.WriteHeader(http.StatusNotFound)
++		}
++	}))
++	t.Cleanup(upstream.Close)
++
++	forge := &client{API: upstream.URL + "/"}
++	ctx := context.Background()
++	tokenA := "test-only-credential-A"
++	tokenB := "test-only-credential-B"
++	aliasA := githubMetricIdentity(tokenA)
++	aliasB := githubMetricIdentity(tokenB)
++	if aliasA == aliasB || aliasA == tokenA || aliasB == tokenB || aliasA == "overflow" || aliasB == "overflow" {
++		t.Fatalf("credential metrics alias is not distinct and protected: %q, %q", aliasA, aliasB)
++	}
++	apiA, err := forge.newClientToken(ctx, tokenA)
++	if err != nil {
++		t.Fatal(err)
++	}
++	apiB, err := forge.newClientToken(ctx, tokenB)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	beforeGet := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "GET", "branches", "200"))
++	beforePost := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "POST", "statuses", "201"))
++	before403 := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasB, "GET", "branches", "403"))
++
++	// Two real HTTP GETs from the same credential have two RoundTrips.
++	for range 2 {
++		branches, _, callErr := apiA.Repositories.ListBranches(ctx, "octocat", "repo", &github.BranchListOptions{Page: 1})
++		if callErr != nil || len(branches) != 1 || branches[0].GetName() != "main" {
++			t.Fatalf("unexpected branch fetch: %v / %v", branches, callErr)
++		}
++	}
++	_, _, err = apiA.Repositories.CreateStatus(ctx, "octocat", "repo", "abc123", github.RepoStatus{
++		State: new("success"),
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	_, _, err = apiB.Repositories.ListBranches(ctx, "octocat", "denied", &github.BranchListOptions{Page: 1})
++	if err == nil {
++		t.Fatal("rate-limited upstream response must remain an error")
++	}
++
++	if got := actualRequests.Load(); got != 4 {
++		t.Fatalf("expected 4 real upstream requests, got %d", got)
++	}
++	if got := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "GET", "branches", "200")) - beforeGet; got != 2 {
++		t.Fatalf("GET counter=%v, expected 2", got)
++	}
++	if got := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasA, "POST", "statuses", "201")) - beforePost; got != 1 {
++		t.Fatalf("POST status counter=%v, expected 1", got)
++	}
++	if got := testutil.ToFloat64(githubHTTPRequests.WithLabelValues(aliasB, "GET", "branches", "403")) - before403; got != 1 {
++		t.Fatalf("403 counter=%v, expected 1", got)
++	}
++	if remaining := testutil.ToFloat64(githubHTTPQuota.WithLabelValues(aliasB, "core", "remaining")); remaining != 0 {
++		t.Fatalf("quota remaining=%v, expected 0", remaining)
++	}
++	if used := testutil.ToFloat64(githubHTTPQuota.WithLabelValues(aliasA, "core", "used")); used != 9 {
++		t.Fatalf("quota used=%v, expected 9", used)
++	}
++	if got := githubMetricEndpoint("/repos/private-owner/secret-repo/statuses/secret-sha"); got != "statuses" {
++		t.Fatalf("endpoint classification exposes raw details: %q", got)
++	}
++}
