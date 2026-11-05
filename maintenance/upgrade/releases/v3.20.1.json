@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "release": "v3.20.1",
+  "upstream_sha": "3f1bb0bd0db28e410ad797034d75780116122c91",
+  "source_baseline": "3f6a236dba3981889103fe11a0b30e7522839120",
+  "owning_issue": "WPCK#16",
+  "umbrella_issue": "WFO#1016",
+  "status": "candidate-source-not-deployed",
+  "module_results": [
+    {
+      "id": "github-branch-cache",
+      "result": "applied-clean"
+    },
+    {
+      "id": "github-status-route",
+      "result": "applied-clean",
+      "enabled": false
+    },
+    {
+      "id": "github-http-metrics",
+      "result": "applied-3way-with-reviewed-go-github-v93-import"
+    },
+    {
+      "id": "source-ci",
+      "result": "applied-clean"
+    }
+  ],
+  "external_queue_patch_state": "requires-upstream-compatibility-and-WFO-770-773-contract-validation",
+  "custom_css_js_state": "external-check-required-SRV-863",
+  "protected_runtime": "not-touched",
+  "source_checks": "pending-exact-head"
+}

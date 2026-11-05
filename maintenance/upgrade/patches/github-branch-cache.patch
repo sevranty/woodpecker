@@ -1,0 +1,546 @@
+diff --git a/server/forge/github/branch_cache.go b/server/forge/github/branch_cache.go
+new file mode 100644
+index 0000000..e0ed014
+--- /dev/null
++++ b/server/forge/github/branch_cache.go
+@@ -0,0 +1,133 @@
++// Copyright 2026 Woodpecker Authors
++// Licensed under the Apache License, Version 2.0 (the "License").
++package github
++
++import (
++	"context"
++	"crypto/sha256"
++	"sync"
++	"time"
++)
++
++const (
++	defaultBranchCacheTTL = 15 * time.Second
++	maxBranchCacheEntries = 256
++)
++
++type branchCacheKey struct {
++	credential [32]byte
++	owner      string
++	repo       string
++	page       int
++	perPage    int
++}
++
++func newBranchCacheKey(token, owner, repo string, page, perPage int) branchCacheKey {
++	return branchCacheKey{
++		credential: sha256.Sum256([]byte(token)),
++		owner:      owner, repo: repo, page: page, perPage: perPage,
++	}
++}
++
++type branchCacheEntry struct {
++	value   []string
++	err     error
++	expires time.Time
++}
++
++type branchFlight struct {
++	done  chan struct{}
++	value []string
++	err   error
++}
++
++type branchCache struct {
++	mu       sync.Mutex
++	entries  map[branchCacheKey]branchCacheEntry
++	inFlight map[branchCacheKey]*branchFlight
++	ttl      time.Duration // test override; zero means defaultBranchCacheTTL
++}
++
++func copyBranches(in []string) []string {
++	if in == nil {
++		return nil
++	}
++	return append([]string{}, in...)
++}
++
++// get returns a short-lived, token-scoped snapshot of successful branch lists.
++// Concurrent requests share a single HTTP call. Only explicit rate-limit errors
++// receive a temporary cooldown; ordinary permission errors are never cached.
++func (c *branchCache) get(
++	ctx context.Context,
++	key branchCacheKey,
++	fetch func() (names []string, err error, cooldown time.Duration),
++) ([]string, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
++
++	c.mu.Lock()
++	if entry, ok := c.entries[key]; ok && time.Now().Before(entry.expires) {
++		c.mu.Unlock()
++		return copyBranches(entry.value), entry.err
++	}
++	if flight, ok := c.inFlight[key]; ok {
++		c.mu.Unlock()
++		select {
++		case <-flight.done:
++			return copyBranches(flight.value), flight.err
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		}
++	}
++	if c.inFlight == nil {
++		c.inFlight = make(map[branchCacheKey]*branchFlight)
++	}
++	flight := &branchFlight{done: make(chan struct{})}
++	c.inFlight[key] = flight
++	c.mu.Unlock()
++
++	// The initiator makes the request without holding the cache mutex.
++	names, err, cooldown := fetch()
++
++	c.mu.Lock()
++	flight.value, flight.err = copyBranches(names), err
++	expiry := time.Duration(0)
++	if err == nil {
++		expiry = c.ttl
++		if expiry == 0 {
++			expiry = defaultBranchCacheTTL
++		}
++	} else if cooldown > 0 {
++		expiry = cooldown
++	}
++	if expiry > 0 {
++		if c.entries == nil {
++			c.entries = make(map[branchCacheKey]branchCacheEntry)
++		}
++		now := time.Now()
++		// Never allow a long-lived unbounded cache on a busy multi-user forge.
++		for k, entry := range c.entries {
++			if !now.Before(entry.expires) {
++				delete(c.entries, k)
++			}
++		}
++		if len(c.entries) >= maxBranchCacheEntries {
++			var oldestKey branchCacheKey
++			var oldest time.Time
++			first := true
++			for k, entry := range c.entries {
++				if first || entry.expires.Before(oldest) {
++					first, oldestKey, oldest = false, k, entry.expires
++				}
++			}
++			delete(c.entries, oldestKey)
++		}
++		c.entries[key] = branchCacheEntry{value: copyBranches(names), err: err, expires: now.Add(expiry)}
++	}
++	delete(c.inFlight, key)
++	close(flight.done)
++	c.mu.Unlock()
++	return copyBranches(names), err
++}
+diff --git a/server/forge/github/branch_cache_test.go b/server/forge/github/branch_cache_test.go
+new file mode 100644
+index 0000000..5fb5f09
+--- /dev/null
++++ b/server/forge/github/branch_cache_test.go
+@@ -0,0 +1,139 @@
++package github
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestBranchCacheReuseAndIdentity(t *testing.T) {
++	var cache branchCache
++	key := newBranchCacheKey("tokenA", "owner", "repo", 1, 50)
++	var calls int
++	fetch := func() ([]string, error, time.Duration) {
++		calls++
++		return []string{"main"}, nil, 0
++	}
++	a, err := cache.get(context.Background(), key, fetch)
++	if err != nil || calls != 1 || len(a) != 1 {
++		t.Fatalf("first call: result=%v err=%v calls=%d", a, err, calls)
++	}
++	a[0] = "modified"
++	b, err := cache.get(context.Background(), key, fetch)
++	if err != nil || calls != 1 || b[0] != "main" {
++		t.Fatalf("cached result copied: result=%v err=%v calls=%d", b, err, calls)
++	}
++	_, _ = cache.get(context.Background(), newBranchCacheKey("tokenB", "owner", "repo", 1, 50), fetch)
++	_, _ = cache.get(context.Background(), newBranchCacheKey("tokenA", "owner", "repo", 2, 50), fetch)
++	_, _ = cache.get(context.Background(), newBranchCacheKey("tokenA", "other", "repo", 1, 50), fetch)
++	if calls != 4 {
++		t.Fatalf("different identity/page/repo were coalesced: calls=%d", calls)
++	}
++}
++
++func TestBranchCacheConcurrentRequests(t *testing.T) {
++	var cache branchCache
++	key := newBranchCacheKey("token", "owner", "repo", 1, 50)
++	var calls atomic.Int32
++	var wait sync.WaitGroup
++	start := make(chan struct{})
++	for range 24 {
++		wait.Add(1)
++		go func() {
++			defer wait.Done()
++			<-start
++			got, err := cache.get(context.Background(), key, func() ([]string, error, time.Duration) {
++				calls.Add(1)
++				time.Sleep(10 * time.Millisecond)
++				return []string{"main"}, nil, 0
++			})
++			if err != nil || len(got) != 1 || got[0] != "main" {
++				t.Errorf("unexpected result %v, %v", got, err)
++			}
++		}()
++	}
++	close(start)
++	wait.Wait()
++	if calls.Load() != 1 {
++		t.Fatalf("expected one API fetch, got %d", calls.Load())
++	}
++}
++
++func TestBranchCacheExpiryAndErrors(t *testing.T) {
++	var cache branchCache
++	cache.ttl = 5 * time.Millisecond
++	key := newBranchCacheKey("token", "o", "r", 1, 50)
++	calls := 0
++	fetch := func() ([]string, error, time.Duration) {
++		calls++
++		return []string{"main"}, nil, 0
++	}
++	_, _ = cache.get(context.Background(), key, fetch)
++	time.Sleep(7 * time.Millisecond)
++	_, _ = cache.get(context.Background(), key, fetch)
++	if calls != 2 {
++		t.Fatalf("expired cache reused, calls=%d", calls)
++	}
++	badKey := newBranchCacheKey("token", "o", "bad", 1, 50)
++	permission := errors.New("permission denied")
++	fail := func() ([]string, error, time.Duration) { calls++; return nil, permission, 0 }
++	_, _ = cache.get(context.Background(), badKey, fail)
++	_, _ = cache.get(context.Background(), badKey, fail)
++	if calls != 4 {
++		t.Fatalf("permission error was cached, calls=%d", calls)
++	}
++}
++
++func TestBranchCacheRateLimitCooldown(t *testing.T) {
++	var cache branchCache
++	key := newBranchCacheKey("token", "o", "r", 1, 50)
++	rateLimited := errors.New("rate limited")
++	calls := 0
++	fetch := func() ([]string, error, time.Duration) {
++		calls++
++		return nil, rateLimited, 100 * time.Millisecond
++	}
++	_, err := cache.get(context.Background(), key, fetch)
++	if !errors.Is(err, rateLimited) {
++		t.Fatalf("unexpected first error %v", err)
++	}
++	_, err = cache.get(context.Background(), key, fetch)
++	if !errors.Is(err, rateLimited) || calls != 1 {
++		t.Fatalf("cooldown ignored err=%v calls=%d", err, calls)
++	}
++	time.Sleep(105 * time.Millisecond)
++	_, _ = cache.get(context.Background(), key, fetch)
++	if calls != 2 {
++		t.Fatalf("expired cooldown ignored: calls=%d", calls)
++	}
++}
++
++func TestBranchCacheBounded(t *testing.T) {
++	var cache branchCache
++	for i := range maxBranchCacheEntries + 16 {
++		key := newBranchCacheKey("token", "o", string(rune(i)), 1, 50)
++		_, _ = cache.get(context.Background(), key, func() ([]string, error, time.Duration) {
++			return []string{"main"}, nil, 0
++		})
++	}
++	if len(cache.entries) > maxBranchCacheEntries {
++		t.Fatalf("cache unbounded: %d entries", len(cache.entries))
++	}
++}
++
++func TestBranchCacheCancelledContext(t *testing.T) {
++	var cache branchCache
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	called := false
++	_, err := cache.get(ctx, newBranchCacheKey("token", "o", "r", 1, 50), func() ([]string, error, time.Duration) {
++		called = true
++		return nil, nil, 0
++	})
++	if !errors.Is(err, context.Canceled) || called {
++		t.Fatalf("cancelled fetch ran; err=%v called=%v", err, called)
++	}
++}
+diff --git a/server/forge/github/github.go b/server/forge/github/github.go
+index b04edd6..e5a100c 100644
+--- a/server/forge/github/github.go
++++ b/server/forge/github/github.go
+@@ -84,15 +84,16 @@ func New(id int64, opts Opts) (forge.Forge, error) {
+ }
+ 
+ type client struct {
+-	id         int64
+-	url        string
+-	API        string
+-	Client     string
+-	Secret     string
+-	SkipVerify bool
+-	MergeRef   bool
+-	OnlyPublic bool
+-	oAuthHost  string
++	id            int64
++	url           string
++	API           string
++	Client        string
++	Secret        string
++	SkipVerify    bool
++	MergeRef      bool
++	OnlyPublic    bool
++	oAuthHost     string
++	branchesCache branchCache
+ }
+ 
+ // Name returns the string name of this driver.
+@@ -635,24 +636,63 @@ func (c *client) Activate(ctx context.Context, u *model.User, r *model.Repo, lin
+ // Branches returns the names of all branches for the named repository.
+ func (c *client) Branches(ctx context.Context, u *model.User, r *model.Repo, p *model.ListOptions) ([]string, error) {
+ 	token := common.UserToken(ctx, r, u)
+-	client, err := c.newClientToken(ctx, token)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	githubBranches, _, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
+-		Page:    p.Page,
+-		PerPage: perPage(p.PerPage),
++	key := newBranchCacheKey(token, r.Owner, r.Name, p.Page, perPage(p.PerPage))
++	return c.branchesCache.get(ctx, key, func() ([]string, error, time.Duration) {
++		client, err := c.newClientToken(ctx, token)
++		if err != nil {
++			return nil, err, 0
++		}
++		githubBranches, resp, err := client.Repositories.ListBranches(ctx, r.Owner, r.Name, &github.BranchListOptions{
++			Page:    p.Page,
++			PerPage: perPage(p.PerPage),
++		})
++		if err != nil {
++			return nil, err, branchCooldown(resp, err)
++		}
++		branches := make([]string, 0, len(githubBranches))
++		for _, branch := range githubBranches {
++			branches = append(branches, branch.GetName())
++		}
++		return branches, nil, 0
+ 	})
+-	if err != nil {
+-		return nil, err
+-	}
++}
+ 
+-	branches := make([]string, 0)
+-	for _, branch := range githubBranches {
+-		branches = append(branches, *branch.Name)
++// branchCooldown backs off only on proven quota errors; ordinary permission
++// denials (403) are not cached or silently treated as rate limits.
++func branchCooldown(resp *github.Response, err error) time.Duration {
++	if resp == nil || resp.Response == nil {
++		return 0
++	}
++	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
++		return 0
++	}
++	var cooldown time.Duration
++	if raw := resp.Header.Get("Retry-After"); raw != "" {
++		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && seconds >= 0 && seconds < int64((1<<63-1)/int64(time.Second))-1 {
++			cooldown = time.Duration(seconds+1) * time.Second
++		} else if retryDate, parseErr := http.ParseTime(raw); parseErr == nil {
++			if delay := time.Until(retryDate); delay > 0 {
++				cooldown = delay + time.Second
++			}
++		}
++	}
++	// Primary reset and secondary Retry-After can appear together.
++	// Honor the later deadline so the cache never retries on an exhausted quota.
++	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
++		primaryDelay := time.Minute
++		if reset, parseErr := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); parseErr == nil {
++			if delay := time.Until(time.Unix(reset, 0)); delay > 0 {
++				primaryDelay = delay + time.Second
++			}
++		}
++		if primaryDelay > cooldown {
++			cooldown = primaryDelay
++		}
++	}
++	if cooldown == 0 && (resp.StatusCode == http.StatusTooManyRequests || (err != nil && strings.Contains(strings.ToLower(err.Error()), "secondary rate limit"))) {
++		return time.Minute
+ 	}
+-	return branches, nil
++	return cooldown
+ }
+ 
+ // BranchHead returns the sha of the head (latest commit) of the specified branch.
+diff --git a/server/forge/github/github_branch_cache_integration_test.go b/server/forge/github/github_branch_cache_integration_test.go
+new file mode 100644
+index 0000000..4d1dfef
+--- /dev/null
++++ b/server/forge/github/github_branch_cache_integration_test.go
+@@ -0,0 +1,147 @@
++// Copyright 2026 Woodpecker Authors
++// Licensed under the Apache License, Version 2.0 (the "License").
++package github
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/google/go-github/v92/github"
++	"go.woodpecker-ci.org/woodpecker/v3/server/model"
++)
++
++func testGithubBranchesClient(t *testing.T, handler http.HandlerFunc) (context.Context, *client, *atomic.Int32) {
++	t.Helper()
++	var requests atomic.Int32
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requests.Add(1)
++		handler(w, r)
++	}))
++	t.Cleanup(server.Close)
++	gh, err := github.NewClient(github.WithURLs(new(server.URL+"/"), nil), github.WithHTTPClient(server.Client()))
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.WithValue(context.Background(), githubClientKey, gh)
++	return ctx, &client{}, &requests
++}
++
++func TestGitHubBranchesDeduplicatesWithinTokenAndPage(t *testing.T) {
++	ctx, forge, requests := testGithubBranchesClient(t, func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/repos/octocat/repo/branches" {
++			t.Errorf("unexpected endpoint: %s", r.URL.Path)
++		}
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = fmt.Fprint(w, `[{"name":"main"}]`)
++	})
++	user := &model.User{AccessToken: "token-1"}
++	repo := &model.Repo{Owner: "octocat", Name: "repo"}
++	opts := &model.ListOptions{Page: 1, PerPage: 50}
++	for range 2 {
++		list, err := forge.Branches(ctx, user, repo, opts)
++		if err != nil || len(list) != 1 || list[0] != "main" {
++			t.Fatalf("unexpected branches %v, error %v", list, err)
++		}
++	}
++	if requests.Load() != 1 {
++		t.Fatalf("expected one GitHub request, got %d", requests.Load())
++	}
++	_, _ = forge.Branches(ctx, user, repo, &model.ListOptions{Page: 2, PerPage: 50})
++	_, _ = forge.Branches(ctx, &model.User{AccessToken: "token-2"}, repo, opts)
++	if requests.Load() != 3 {
++		t.Fatalf("different page/token requests incorrectly shared: %d", requests.Load())
++	}
++}
++
++func TestGitHubBranchesRateLimitCooldown(t *testing.T) {
++	ctx, forge, requests := testGithubBranchesClient(t, func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.Header().Set("X-RateLimit-Remaining", "0")
++		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(40*time.Second).Unix(), 10))
++		w.WriteHeader(http.StatusForbidden)
++		_, _ = fmt.Fprint(w, `{"message":"API rate limit exceeded"}`)
++	})
++	user := &model.User{AccessToken: "token"}
++	repo := &model.Repo{Owner: "octocat", Name: "repo"}
++	opts := &model.ListOptions{Page: 1, PerPage: 50}
++	for range 2 {
++		result, err := forge.Branches(ctx, user, repo, opts)
++		if err == nil || result != nil {
++			t.Fatalf("rate limit should be propagated, got %v / %v", result, err)
++		}
++	}
++	if requests.Load() != 1 {
++		t.Fatalf("rate-limit cooldown did not prevent second HTTP request: %d", requests.Load())
++	}
++}
++
++func TestGitHubBranchesPermission403IsNotRateLimit(t *testing.T) {
++	ctx, forge, requests := testGithubBranchesClient(t, func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusForbidden)
++		_, _ = fmt.Fprint(w, `{"message":"Resource not accessible by integration"}`)
++	})
++	for range 2 {
++		if _, err := forge.Branches(ctx, &model.User{AccessToken: "token"}, &model.Repo{Owner: "octocat", Name: "repo"}, &model.ListOptions{Page: 1, PerPage: 50}); err == nil {
++			t.Fatal("expected 403")
++		}
++	}
++	if requests.Load() != 2 {
++		t.Fatalf("ordinary 403 was cached as quota failure: %d", requests.Load())
++	}
++}
++
++func TestGitHubBranchesSecondaryRetryAfter(t *testing.T) {
++	ctx, forge, requests := testGithubBranchesClient(t, func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.Header().Set("Retry-After", "30")
++		w.WriteHeader(http.StatusTooManyRequests)
++		_, _ = fmt.Fprint(w, `{"message":"secondary rate limit"}`)
++	})
++	for range 2 {
++		if result, err := forge.Branches(ctx,
++			&model.User{AccessToken: "token"}, &model.Repo{Owner: "octocat", Name: "repo"},
++			&model.ListOptions{Page: 1, PerPage: 50},
++		); err == nil || result != nil {
++			t.Fatalf("secondary rate-limit must not look successful, got %v, %v", result, err)
++		}
++	}
++	if requests.Load() != 1 {
++		t.Fatalf("Retry-After cooldown ignored: %d requests", requests.Load())
++	}
++}
++
++func TestGitHubBranchCooldownWaitsForBothHeaders(t *testing.T) {
++	tests := []struct {
++		name       string
++		status     int
++		resetAfter time.Duration
++		retryAfter string
++		minimum    time.Duration
++	}{
++		{name: "primary reset later", status: http.StatusForbidden, resetAfter: 95 * time.Second, retryAfter: "5", minimum: 90 * time.Second},
++		{name: "retry after later", status: http.StatusTooManyRequests, resetAfter: 10 * time.Second, retryAfter: "95", minimum: 95 * time.Second},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			headers := make(http.Header)
++			headers.Set("Retry-After", tt.retryAfter)
++			headers.Set("X-RateLimit-Remaining", "0")
++			headers.Set("X-RateLimit-Reset", strconv.FormatInt(time.Now().Add(tt.resetAfter).Unix(), 10))
++			resp := &github.Response{Response: &http.Response{StatusCode: tt.status, Header: headers}}
++			if got := branchCooldown(resp, fmt.Errorf("rate limit")); got < tt.minimum {
++				t.Fatalf("cooldown %s is shorter than the required %s", got, tt.minimum)
++			}
++		})
++	}
++	permission := &github.Response{Response: &http.Response{StatusCode: http.StatusForbidden, Header: make(http.Header)}}
++	if got := branchCooldown(permission, fmt.Errorf("permission denied")); got != 0 {
++		t.Fatalf("ordinary permission 403 was incorrectly delayed: %s", got)
++	}
++}
