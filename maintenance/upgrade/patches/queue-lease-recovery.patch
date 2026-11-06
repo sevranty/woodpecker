@@ -1,0 +1,2278 @@
+diff --git a/server/model/task.go b/server/model/task.go
+index 13daf88c..0c077077 100644
+--- a/server/model/task.go
++++ b/server/model/task.go
+@@ -34,6 +34,10 @@ type Task struct {
+ 	AgentID      int64                  `json:"agent_id"     xorm:"'agent_id'"`
+ 	PipelineID   int64                  `json:"pipeline_id"  xorm:"'pipeline_id'"`
+ 	RepoID       int64                  `json:"repo_id"      xorm:"'repo_id'"`
++	// LeaseAttempts is persisted while an expired task waits for re-dispatch.
++	// It makes the retry budget survive a server restart instead of resetting
++	// every time the in-memory queue is rebuilt.
++	LeaseAttempts int `json:"lease_attempts" xorm:"NOT NULL DEFAULT 0 'lease_attempts'"`
+ 	// ConcurrencyLimit is the maximum number of tasks sharing the same
+ 	// ConcurrencyGroup that may run at once. A value <= 0 means unlimited.
+ 	ConcurrencyLimit int `json:"concurrency_limit" xorm:"NOT NULL DEFAULT 0 'concurrency_limit'"`
+diff --git a/server/queue/fifo.go b/server/queue/fifo.go
+index 093b2f28..6d0d6c96 100644
+--- a/server/queue/fifo.go
++++ b/server/queue/fifo.go
+@@ -37,20 +37,22 @@ type entry struct {
+ type worker struct {
+ 	agentID int64
+ 	filter  func(*model.Task) (bool, int)
+-	channel chan *model.Task
++	channel chan *entry
+ 	stop    context.CancelCauseFunc
+ }
+ 
+ type fifo struct {
+ 	sync.Mutex
+ 
+-	ctx           context.Context
+-	workers       map[*worker]struct{}
+-	running       map[string]*entry
+-	pending       *list.List
+-	waitingOnDeps *list.List
+-	extension     time.Duration
+-	paused        bool
++	ctx            context.Context
++	workers        map[*worker]struct{}
++	running        map[string]*entry
++	pending        *list.List
++	waitingOnDeps  *list.List
++	extension      time.Duration
++	paused         bool
++	maxAssignments int
++	onLeaseExpired func(*model.Task, bool) error
+ }
+ 
+ // processTimeInterval is the time till the queue rearranges things,
+@@ -84,12 +86,19 @@ func (q *fifo) PushAtOnce(_ context.Context, tasks []*model.Task) error {
+ 
+ // Poll retrieves and removes a task head of this queue.
+ func (q *fifo) Poll(c context.Context, agentID int64, filter func(*model.Task) (bool, int)) (*model.Task, error) {
++	return q.pollWithValidation(c, agentID, filter, nil)
++}
++
++// pollWithValidation validates an assignment outside the queue lock, then checks
++// that cancellation or expiry did not remove or replace that exact lease while
++// validation was in progress.
++func (q *fifo) pollWithValidation(c context.Context, agentID int64, filter func(*model.Task) (bool, int), validate func(*model.Task) *model.Task) (*model.Task, error) {
+ 	q.Lock()
+ 	ctx, stop := context.WithCancelCause(c)
+ 
+ 	w := &worker{
+ 		agentID: agentID,
+-		channel: make(chan *model.Task, 1),
++		channel: make(chan *entry, 1),
+ 		filter:  filter,
+ 		stop:    stop,
+ 	}
+@@ -103,8 +112,18 @@ func (q *fifo) Poll(c context.Context, agentID int64, filter func(*model.Task) (
+ 			delete(q.workers, w)
+ 			q.Unlock()
+ 			return nil, ctx.Err()
+-		case t := <-w.channel:
+-			return t, nil
++		case assigned := <-w.channel:
++			task := assigned.item
++			if validate != nil {
++				task = validate(task)
++			}
++			q.Lock()
++			current := q.running[assigned.item.ID] == assigned
++			q.Unlock()
++			if !current {
++				return nil, nil
++			}
++			return task, nil
+ 		}
+ 	}
+ }
+@@ -158,29 +177,81 @@ func (q *fifo) finished(ids []string, exitStatus model.StatusValue, err error) e
+ 	return errors.Join(errs...)
+ }
+ 
+-// Wait waits until the item is done executing.
+-// Also signals via error ErrCancel if workflow got canceled.
+-func (q *fifo) Wait(ctx context.Context, taskID string) error {
++// Wait waits until the item leased to the agent is done executing.
++// Also signals via error ErrCancel if workflow got canceled, ErrTaskExpired
++// if the task is queued again and ErrAgentMissMatch if another agent holds
++// the lease, so a slow agent stops instead of running next to the new one.
++func (q *fifo) Wait(ctx context.Context, agentID int64, taskID string) error {
+ 	q.Lock()
+-	state := q.running[taskID]
++	state, err := q.leaseOf(agentID, taskID)
+ 	q.Unlock()
+-	if state != nil {
+-		select {
+-		case <-ctx.Done():
+-		case <-state.done:
+-			// check if we have a wrapped cancel error and unwrap it
+-			if errors.Is(state.error, ErrCancel) {
+-				return ErrCancel
+-			}
+-			// or return queue errors and no workflow errors
+-			if !errors.Is(state.error, new(ErrExternal)) {
+-				return state.error
+-			}
++	if err != nil || state == nil {
++		return err
++	}
++	select {
++	case <-ctx.Done():
++	case <-state.done:
++		// check if we have a wrapped cancel error and unwrap it
++		if errors.Is(state.error, ErrCancel) {
++			return ErrCancel
++		}
++		// or return queue errors and no workflow errors
++		if !errors.Is(state.error, new(ErrExternal)) {
++			return state.error
+ 		}
+ 	}
+ 	return nil
+ }
+ 
++// Leased reports whether the agent holds the lease of the task.
++func (q *fifo) Leased(_ context.Context, agentID int64, taskID string) error {
++	q.Lock()
++	defer q.Unlock()
++
++	state, err := q.leaseOf(agentID, taskID)
++	if err != nil {
++		return err
++	}
++	if state == nil {
++		return ErrNotFound
++	}
++	return nil
++}
++
++// leaseOf returns the running entry of the task if the agent holds its lease.
++// A task that is pending or waiting on dependencies again lost its lease
++// (ErrTaskExpired), one running under another agent was handed out again
++// (ErrAgentMissMatch), and one the queue does not know gives nil, nil.
++// Expects the queue to be locked by the caller.
++func (q *fifo) leaseOf(agentID int64, taskID string) (*entry, error) {
++	if state, ok := q.running[taskID]; ok {
++		if state.item.AgentID != agentID {
++			return nil, ErrAgentMissMatch
++		}
++		return state, nil
++	}
++	if q.queued(taskID) {
++		return nil, ErrTaskExpired
++	}
++	return nil, nil
++}
++
++// queued reports whether the task is pending or waiting on dependencies.
++// Expects the queue to be locked by the caller.
++func (q *fifo) queued(taskID string) bool {
++	for element := q.pending.Front(); element != nil; element = element.Next() {
++		if task, _ := element.Value.(*model.Task); task.ID == taskID {
++			return true
++		}
++	}
++	for element := q.waitingOnDeps.Front(); element != nil; element = element.Next() {
++		if task, _ := element.Value.(*model.Task); task.ID == taskID {
++			return true
++		}
++	}
++	return false
++}
++
+ // Extend extends the task execution deadline.
+ func (q *fifo) Extend(_ context.Context, agentID int64, taskID string) error {
+ 	q.Lock()
+@@ -271,6 +342,7 @@ func (q *fifo) process() {
+ 		q.filterWaiting()
+ 		for pending, worker := q.assignToWorker(); pending != nil && worker != nil; pending, worker = q.assignToWorker() {
+ 			task, _ := pending.Value.(*model.Task)
++			task.LeaseAttempts++
+ 			task.AgentID = worker.agentID
+ 			delete(q.workers, worker)
+ 			q.pending.Remove(pending)
+@@ -279,7 +351,7 @@ func (q *fifo) process() {
+ 				done:     make(chan bool),
+ 				deadline: time.Now().Add(q.extension),
+ 			}
+-			worker.channel <- task
++			worker.channel <- q.running[task.ID]
+ 		}
+ 		q.Unlock()
+ 	}
+@@ -435,11 +507,24 @@ func taskOrderLess(a, b *model.Task) bool {
+ func (q *fifo) resubmitExpiredPipelines() {
+ 	for taskID, taskState := range q.running {
+ 		if time.Now().After(taskState.deadline) {
+-			log.Info().Str("task_id", taskID).Msg("queue: resubmitting expired task")
++			exhausted := q.maxAssignments > 0 && taskState.item.LeaseAttempts >= q.maxAssignments
++			if q.onLeaseExpired != nil {
++				if err := q.onLeaseExpired(taskState.item, exhausted); err != nil {
++					log.Error().Err(err).Str("task_id", taskID).Msg("queue: failed to persist expired lease transition")
++					taskState.deadline = time.Now().Add(q.extension)
++					continue
++				}
++			}
+ 			taskState.error = ErrTaskExpired
+-			q.pending.PushFront(taskState.item)
+ 			delete(q.running, taskID)
+ 			close(taskState.done)
++			if exhausted {
++				log.Error().Str("task_id", taskID).Int("assignments", taskState.item.LeaseAttempts).Msg("queue: lease retry budget exhausted")
++				q.updateDepStatusInQueue(taskID, model.StatusFailure)
++				continue
++			}
++			log.Info().Str("task_id", taskID).Int("assignments", taskState.item.LeaseAttempts).Msg("queue: resubmitting expired task")
++			q.pending.PushFront(taskState.item)
+ 		}
+ 	}
+ }
+diff --git a/server/queue/fifo_test.go b/server/queue/fifo_test.go
+index f253259d..1dbbe514 100644
+--- a/server/queue/fifo_test.go
++++ b/server/queue/fifo_test.go
+@@ -130,7 +130,7 @@ func TestFifoBasicOperations(t *testing.T) {
+ 		// Start waiting on the task
+ 		waitDone := make(chan error, 1)
+ 		go func() {
+-			waitDone <- q.Wait(ctx, got1.ID)
++			waitDone <- q.Wait(ctx, 1, got1.ID)
+ 		}()
+ 
+ 		time.Sleep(10 * time.Millisecond)
+@@ -158,7 +158,7 @@ func TestFifoBasicOperations(t *testing.T) {
+ 		waitCtx, waitCancel := context.WithCancelCause(ctx)
+ 		waitDone2 := make(chan error, 1)
+ 		go func() {
+-			waitDone2 <- q.Wait(waitCtx, got2.ID)
++			waitDone2 <- q.Wait(waitCtx, 2, got2.ID)
+ 		}()
+ 
+ 		time.Sleep(10 * time.Millisecond)
+@@ -190,7 +190,7 @@ func TestFifoBasicOperations(t *testing.T) {
+ 		waitResults := make(chan error, numWaiters)
+ 		for range numWaiters {
+ 			go func() {
+-				waitResults <- q.Wait(ctx, got3.ID)
++				waitResults <- q.Wait(ctx, 3, got3.ID)
+ 			}()
+ 		}
+ 
+@@ -1188,7 +1188,7 @@ func TestFifoLeaseManagement(t *testing.T) {
+ 		assert.NoError(t, err)
+ 
+ 		errCh := make(chan error, 1)
+-		go func() { errCh <- q.Wait(ctx, got.ID) }()
++		go func() { errCh <- q.Wait(ctx, 1, got.ID) }()
+ 
+ 		waitForProcess()
+ 		select {
+@@ -1264,7 +1264,7 @@ func TestFifoLeaseManagement(t *testing.T) {
+ 
+ 		var wg sync.WaitGroup
+ 		wg.Go(func() {
+-			assert.NoError(t, q.Wait(ctx, got.ID))
++			assert.NoError(t, q.Wait(ctx, 1, got.ID))
+ 		})
+ 
+ 		time.Sleep(time.Millisecond)
+@@ -1272,7 +1272,7 @@ func TestFifoLeaseManagement(t *testing.T) {
+ 		wg.Wait()
+ 
+ 		// Edge case: Wait on non-existent task should return immediately
+-		assert.NoError(t, q.Wait(ctx, "non-existent"))
++		assert.NoError(t, q.Wait(ctx, 1, "non-existent"))
+ 
+ 		dummyTask2 := &model.Task{ID: "wait-2"}
+ 		assert.NoError(t, q.PushAtOnce(ctx, []*model.Task{dummyTask2}))
+@@ -1281,7 +1281,7 @@ func TestFifoLeaseManagement(t *testing.T) {
+ 
+ 		waitCtx, waitCancel := context.WithCancelCause(ctx)
+ 		errCh := make(chan error, 1)
+-		go func() { errCh <- q.Wait(waitCtx, got2.ID) }()
++		go func() { errCh <- q.Wait(waitCtx, 1, got2.ID) }()
+ 
+ 		time.Sleep(50 * time.Millisecond)
+ 		waitCancel(nil)
+@@ -1307,7 +1307,7 @@ func TestFifoLeaseManagement(t *testing.T) {
+ 		wg2.Add(3)
+ 		for range 3 {
+ 			go func() {
+-				assert.NoError(t, q.Wait(ctx, got3.ID))
++				assert.NoError(t, q.Wait(ctx, 1, got3.ID))
+ 				wg2.Done()
+ 			}()
+ 		}
+@@ -1587,3 +1587,90 @@ func findTaskByAgent(tasks map[string]int64, agentID int64) string {
+ 	}
+ 	return ""
+ }
++
++func TestFifoWaitLeaseOwnership(t *testing.T) {
++	ctx, cancel, q := setupTestQueue(t)
++	defer cancel(nil)
++
++	t.Run("wait and leased follow the lease", func(t *testing.T) {
++		q.extension = 0
++		t.Cleanup(func() {
++			q.extension = 50 * time.Millisecond
++		})
++		assert.NoError(t, q.PushAtOnce(ctx, []*model.Task{{ID: "lease-own-1"}}))
++
++		waitForProcess()
++		got, err := q.Poll(ctx, 1, filterFnTrue)
++		require.NoError(t, err)
++
++		// the lease holder is accepted, any other agent is not
++		assert.NoError(t, q.Leased(ctx, 1, got.ID))
++		assert.ErrorIs(t, q.Leased(ctx, 2, got.ID), ErrAgentMissMatch)
++		assert.ErrorIs(t, q.Wait(ctx, 2, got.ID), ErrAgentMissMatch)
++
++		// once the lease expired the task is pending again and the old holder
++		// has lost it: Wait must not report it as finished
++		waitForProcess()
++		assert.ErrorIs(t, q.Leased(ctx, 1, got.ID), ErrTaskExpired)
++		assert.ErrorIs(t, q.Wait(ctx, 1, got.ID), ErrTaskExpired)
++
++		// a task the queue does not know keeps the old behavior, so agents
++		// outlive a server restart
++		assert.NoError(t, q.Wait(ctx, 1, "non-existent"))
++		assert.ErrorIs(t, q.Leased(ctx, 1, "non-existent"), ErrNotFound)
++
++		// the agent that polls the task again holds the new lease
++		q.extension = 50 * time.Millisecond
++		got2, err := q.Poll(ctx, 2, filterFnTrue)
++		require.NoError(t, err)
++		assert.Equal(t, got.ID, got2.ID)
++		assert.NoError(t, q.Leased(ctx, 2, got2.ID))
++		assert.ErrorIs(t, q.Leased(ctx, 1, got2.ID), ErrAgentMissMatch)
++		assert.ErrorIs(t, q.Wait(ctx, 1, got2.ID), ErrAgentMissMatch)
++
++		assert.NoError(t, q.Done(ctx, got2.ID, model.StatusSuccess))
++		waitForProcess()
++		assert.ErrorIs(t, q.Leased(ctx, 2, got2.ID), ErrNotFound)
++
++		info := q.Info(ctx)
++		assert.Len(t, info.Pending, 0)
++		assert.Len(t, info.Running, 0)
++	})
++
++	t.Run("waiting on dependencies counts as lost lease", func(t *testing.T) {
++		q.extension = 0
++		t.Cleanup(func() {
++			q.extension = 50 * time.Millisecond
++		})
++		dep := &model.Task{ID: "lease-own-dep"}
++		task := &model.Task{ID: "lease-own-2", Dependencies: []string{dep.ID}, DepStatus: map[string]model.StatusValue{}}
++		assert.NoError(t, q.PushAtOnce(ctx, []*model.Task{dep, task}))
++
++		waitForProcess()
++		gotDep, err := q.Poll(ctx, 1, filterFnTrue)
++		require.NoError(t, err)
++		assert.Equal(t, dep.ID, gotDep.ID)
++
++		// the dependency expired and is queued again, so the dependent task
++		// keeps waiting on it; neither belongs to agent 1 anymore
++		waitForProcess()
++		assert.ErrorIs(t, q.Leased(ctx, 1, dep.ID), ErrTaskExpired)
++		assert.ErrorIs(t, q.Leased(ctx, 1, task.ID), ErrTaskExpired)
++
++		q.extension = 50 * time.Millisecond
++		gotDep2, err := q.Poll(ctx, 1, filterFnTrue)
++		require.NoError(t, err)
++		assert.NoError(t, q.Done(ctx, gotDep2.ID, model.StatusSuccess))
++		waitForProcess()
++		got2, err := q.Poll(ctx, 1, filterFnTrue)
++		require.NoError(t, err)
++		assert.Equal(t, task.ID, got2.ID)
++		assert.NoError(t, q.Done(ctx, got2.ID, model.StatusSuccess))
++		waitForProcess()
++
++		info := q.Info(ctx)
++		assert.Len(t, info.Pending, 0)
++		assert.Len(t, info.WaitingOnDeps, 0)
++		assert.Len(t, info.Running, 0)
++	})
++}
+diff --git a/server/queue/mocks/mock_Queue.go b/server/queue/mocks/mock_Queue.go
+index 25d7e6c0..6eda3339 100644
+--- a/server/queue/mocks/mock_Queue.go
++++ b/server/queue/mocks/mock_Queue.go
+@@ -391,6 +391,69 @@ func (_c *MockQueue_KickAgentWorkers_Call) RunAndReturn(run func(agentID int64))
+ 	return _c
+ }
+ 
++// Leased provides a mock function for the type MockQueue
++func (_mock *MockQueue) Leased(c context.Context, agentID int64, id string) error {
++	ret := _mock.Called(c, agentID, id)
++
++	if len(ret) == 0 {
++		panic("no return value specified for Leased")
++	}
++
++	var r0 error
++	if returnFunc, ok := ret.Get(0).(func(context.Context, int64, string) error); ok {
++		r0 = returnFunc(c, agentID, id)
++	} else {
++		r0 = ret.Error(0)
++	}
++	return r0
++}
++
++// MockQueue_Leased_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'Leased'
++type MockQueue_Leased_Call struct {
++	*mock.Call
++}
++
++// Leased is a helper method to define mock.On call
++//   - c context.Context
++//   - agentID int64
++//   - id string
++func (_e *MockQueue_Expecter) Leased(c any, agentID any, id any) *MockQueue_Leased_Call {
++	return &MockQueue_Leased_Call{Call: _e.mock.On("Leased", c, agentID, id)}
++}
++
++func (_c *MockQueue_Leased_Call) Run(run func(c context.Context, agentID int64, id string)) *MockQueue_Leased_Call {
++	_c.Call.Run(func(args mock.Arguments) {
++		var arg0 context.Context
++		if args[0] != nil {
++			arg0 = args[0].(context.Context)
++		}
++		var arg1 int64
++		if args[1] != nil {
++			arg1 = args[1].(int64)
++		}
++		var arg2 string
++		if args[2] != nil {
++			arg2 = args[2].(string)
++		}
++		run(
++			arg0,
++			arg1,
++			arg2,
++		)
++	})
++	return _c
++}
++
++func (_c *MockQueue_Leased_Call) Return(err error) *MockQueue_Leased_Call {
++	_c.Call.Return(err)
++	return _c
++}
++
++func (_c *MockQueue_Leased_Call) RunAndReturn(run func(c context.Context, agentID int64, id string) error) *MockQueue_Leased_Call {
++	_c.Call.Return(run)
++	return _c
++}
++
+ // Pause provides a mock function for the type MockQueue
+ func (_mock *MockQueue) Pause() {
+ 	_mock.Called()
+@@ -589,16 +652,16 @@ func (_c *MockQueue_Resume_Call) RunAndReturn(run func()) *MockQueue_Resume_Call
+ }
+ 
+ // Wait provides a mock function for the type MockQueue
+-func (_mock *MockQueue) Wait(c context.Context, id string) error {
+-	ret := _mock.Called(c, id)
++func (_mock *MockQueue) Wait(c context.Context, agentID int64, id string) error {
++	ret := _mock.Called(c, agentID, id)
+ 
+ 	if len(ret) == 0 {
+ 		panic("no return value specified for Wait")
+ 	}
+ 
+ 	var r0 error
+-	if returnFunc, ok := ret.Get(0).(func(context.Context, string) error); ok {
+-		r0 = returnFunc(c, id)
++	if returnFunc, ok := ret.Get(0).(func(context.Context, int64, string) error); ok {
++		r0 = returnFunc(c, agentID, id)
+ 	} else {
+ 		r0 = ret.Error(0)
+ 	}
+@@ -612,24 +675,30 @@ type MockQueue_Wait_Call struct {
+ 
+ // Wait is a helper method to define mock.On call
+ //   - c context.Context
++//   - agentID int64
+ //   - id string
+-func (_e *MockQueue_Expecter) Wait(c any, id any) *MockQueue_Wait_Call {
+-	return &MockQueue_Wait_Call{Call: _e.mock.On("Wait", c, id)}
++func (_e *MockQueue_Expecter) Wait(c any, agentID any, id any) *MockQueue_Wait_Call {
++	return &MockQueue_Wait_Call{Call: _e.mock.On("Wait", c, agentID, id)}
+ }
+ 
+-func (_c *MockQueue_Wait_Call) Run(run func(c context.Context, id string)) *MockQueue_Wait_Call {
++func (_c *MockQueue_Wait_Call) Run(run func(c context.Context, agentID int64, id string)) *MockQueue_Wait_Call {
+ 	_c.Call.Run(func(args mock.Arguments) {
+ 		var arg0 context.Context
+ 		if args[0] != nil {
+ 			arg0 = args[0].(context.Context)
+ 		}
+-		var arg1 string
++		var arg1 int64
+ 		if args[1] != nil {
+-			arg1 = args[1].(string)
++			arg1 = args[1].(int64)
++		}
++		var arg2 string
++		if args[2] != nil {
++			arg2 = args[2].(string)
+ 		}
+ 		run(
+ 			arg0,
+ 			arg1,
++			arg2,
+ 		)
+ 	})
+ 	return _c
+@@ -640,7 +709,7 @@ func (_c *MockQueue_Wait_Call) Return(err error) *MockQueue_Wait_Call {
+ 	return _c
+ }
+ 
+-func (_c *MockQueue_Wait_Call) RunAndReturn(run func(c context.Context, id string) error) *MockQueue_Wait_Call {
++func (_c *MockQueue_Wait_Call) RunAndReturn(run func(c context.Context, agentID int64, id string) error) *MockQueue_Wait_Call {
+ 	_c.Call.Return(run)
+ 	return _c
+ }
+diff --git a/server/queue/persistent.go b/server/queue/persistent.go
+index 8d001c72..d9f9f674 100644
+--- a/server/queue/persistent.go
++++ b/server/queue/persistent.go
+@@ -20,6 +20,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"strconv"
++	"time"
+ 
+ 	"github.com/rs/zerolog/log"
+ 
+@@ -32,10 +33,21 @@ import (
+ // state survives server restarts.
+ const serverConfigQueuePaused = "queue-paused"
+ 
++// maxLeaseAssignments prevents infinite re-dispatch of an expired workflow.
++const maxLeaseAssignments = 3
++
+ // WithTaskStore returns a queue that is backed by the TaskStore. This
+ // ensures pending tasks and the paused flag can be restored when the system
+ // starts.
+ func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
++	if fifoQueue, ok := q.(*fifo); ok {
++		fifoQueue.Lock()
++		fifoQueue.maxAssignments = maxLeaseAssignments
++		fifoQueue.onLeaseExpired = func(task *model.Task, exhausted bool) error {
++			return persistLeaseExpiry(s, task, exhausted)
++		}
++		fifoQueue.Unlock()
++	}
+ 	tasks, _ := s.TaskList()
+ 	for _, task := range tasks {
+ 		restoreDepStatus(s, task)
+@@ -74,6 +86,56 @@ func restoreDepStatus(s store.Store, task *model.Task) {
+ 	}
+ }
+ 
++// persistLeaseExpiry retains the attempt budget across restarts and records
++// terminal workflow failure when the assignment limit is exhausted.
++func persistLeaseExpiry(s store.Store, task *model.Task, exhausted bool) error {
++	if !exhausted {
++		if deleteErr := s.TaskDelete(task.ID); deleteErr != nil && !errors.Is(deleteErr, types.ErrRecordNotExist) {
++			return deleteErr
++		}
++		return s.TaskInsert(task)
++	}
++
++	workflowID, err := strconv.ParseInt(task.ID, 10, 64)
++	if err != nil {
++		return err
++	}
++	workflow, err := s.WorkflowLoad(workflowID)
++	if err != nil {
++		return err
++	}
++	steps, err := s.StepListFromWorkflowFind(workflow)
++	if err != nil {
++		return err
++	}
++
++	// Fail closed on storage errors. The in-memory lease is retained until
++	// the transition succeeds, so it can be retried without extra assignment.
++	now := time.Now().Unix()
++	message := fmt.Sprintf("workflow lease expired after %d assignments", task.LeaseAttempts)
++	for _, step := range steps {
++		if step.State == model.StatusPending || step.State == model.StatusRunning || step.State == model.StatusCreated {
++			step.State = model.StatusFailure
++			step.Error = message
++			step.Finished = now
++			if err := s.StepUpdate(step); err != nil {
++				return err
++			}
++		}
++	}
++	workflow.State = model.StatusFailure
++	workflow.Error = message
++	workflow.Finished = now
++	workflow.AgentID = 0
++	if err := s.WorkflowUpdate(workflow); err != nil {
++		return err
++	}
++	if deleteErr := s.TaskDelete(task.ID); deleteErr != nil && !errors.Is(deleteErr, types.ErrRecordNotExist) {
++		return deleteErr
++	}
++	return nil
++}
++
+ type persistentQueue struct {
+ 	Queue
+ 	store store.Store
+@@ -146,61 +208,75 @@ func (q *persistentQueue) PushAtOnce(c context.Context, tasks []*model.Task) err
+ 
+ // Poll retrieves and removes a task head of this queue.
+ func (q *persistentQueue) Poll(c context.Context, agentID int64, f func(*model.Task) (bool, int)) (*model.Task, error) {
++	validate := func(task *model.Task) *model.Task {
++		return q.validateTask(c, task)
++	}
++	if poller, ok := q.Queue.(interface {
++		pollWithValidation(context.Context, int64, func(*model.Task) (bool, int), func(*model.Task) *model.Task) (*model.Task, error)
++	}); ok {
++		return poller.pollWithValidation(c, agentID, f, validate)
++	}
++
+ 	task, err := q.Queue.Poll(c, agentID, f)
+ 	if task != nil {
+-		log.Debug().Msgf("pull queue item: %s: remove from backup", task.ID)
+-		if deleteErr := q.store.TaskDelete(task.ID); deleteErr != nil {
+-			if errors.Is(deleteErr, types.ErrRecordNotExist) {
+-				// The task is no longer in the backup store, which means it was
+-				// already finished/removed (e.g. its workflow was canceled) and
+-				// only lingered in the in-memory queue. Handing it to the agent
+-				// would loop forever, so drop it from the queue instead.
+-				log.Error().Err(deleteErr).Msgf("pull queue item: %s: not found in backup, dropping stale task", task.ID)
+-				if dropErr := q.Queue.Error(c, task.ID, deleteErr); dropErr != nil {
+-					log.Error().Err(dropErr).Msgf("pull queue item: %s: failed to drop stale task", task.ID)
+-				}
+-				return nil, nil
+-			}
++		task = validate(task)
++		if task == nil {
++			return nil, nil
++		}
++	}
++	return task, err
++}
++
++func (q *persistentQueue) validateTask(c context.Context, task *model.Task) *model.Task {
++	log.Debug().Msgf("pull queue item: %s: remove from backup", task.ID)
++	deleteErr := q.store.TaskDelete(task.ID)
++	if deleteErr != nil {
++		if !errors.Is(deleteErr, types.ErrRecordNotExist) {
+ 			log.Error().Err(deleteErr).Msgf("pull queue item: %s: failed to remove from backup", task.ID)
+-		} else {
+-			log.Debug().Msgf("pull queue item: %s: successfully removed from backup", task.ID)
++		}
++		// A previous assignment already removed the backup of an expired task.
++		// Missing backup alone does not mean its workflow is stale. Expiry still
++		// requeues only in memory; it does not restore the backup across restart.
++	} else {
++		log.Debug().Msgf("pull queue item: %s: successfully removed from backup", task.ID)
++	}
+ 
+-			workflowID, parseErr := strconv.ParseInt(task.ID, 10, 64)
+-			if parseErr != nil {
+-				log.Error().Err(parseErr).Msgf("pull queue item: %s: invalid workflow id", task.ID)
+-				return task, err
++	workflowID, parseErr := strconv.ParseInt(task.ID, 10, 64)
++	if parseErr != nil {
++		log.Error().Err(parseErr).Msgf("pull queue item: %s: invalid workflow id", task.ID)
++		if errors.Is(deleteErr, types.ErrRecordNotExist) {
++			if dropErr := q.Queue.Error(c, task.ID, parseErr); dropErr != nil {
++				log.Error().Err(dropErr).Msgf("pull queue item: %s: failed to drop invalid task", task.ID)
+ 			}
++			return nil
++		}
++		return task
++	}
+ 
+-			workflow, loadErr := q.store.WorkflowLoad(workflowID)
+-			if loadErr != nil {
+-				if errors.Is(loadErr, types.ErrRecordNotExist) {
+-					// A queued task without its workflow can never be initialized.
+-					// Drop it now instead of letting the agent reject and later
+-					// re-poll the same task after its lease expires.
+-					log.Error().Err(loadErr).Msgf("pull queue item: %s: workflow missing, dropping stale task", task.ID)
+-					if dropErr := q.Queue.Error(c, task.ID, loadErr); dropErr != nil {
+-						log.Error().Err(dropErr).Msgf("pull queue item: %s: failed to drop stale task", task.ID)
+-					}
+-					return nil, nil
+-				}
+-				log.Error().Err(loadErr).Msgf("pull queue item: %s: failed to load workflow", task.ID)
+-				return task, err
++	workflow, loadErr := q.store.WorkflowLoad(workflowID)
++	if loadErr != nil {
++		if errors.Is(loadErr, types.ErrRecordNotExist) {
++			// A queued task without its workflow can never be initialized.
++			log.Error().Err(loadErr).Msgf("pull queue item: %s: workflow missing, dropping stale task", task.ID)
++			if dropErr := q.Queue.Error(c, task.ID, loadErr); dropErr != nil {
++				log.Error().Err(dropErr).Msgf("pull queue item: %s: failed to drop stale task", task.ID)
+ 			}
++			return nil
++		}
++		log.Error().Err(loadErr).Msgf("pull queue item: %s: failed to load workflow", task.ID)
++		return task
++	}
+ 
+-			if isTerminalWorkflowState(workflow.State) {
+-				// The task can still exist in the persistent queue while its
+-				// workflow was completed through another path. Returning it to an
+-				// agent makes RPC.Init reject it as already finished, while the
+-				// in-memory task remains running and is resubmitted after timeout.
+-				log.Warn().Str("state", string(workflow.State)).Msgf("pull queue item: %s: workflow already terminal, dropping stale task", task.ID)
+-				if dropErr := q.Queue.Done(c, task.ID, workflow.State); dropErr != nil {
+-					log.Error().Err(dropErr).Msgf("pull queue item: %s: failed to drop terminal task", task.ID)
+-				}
+-				return nil, nil
+-			}
++	if isTerminalWorkflowState(workflow.State) {
++		// Returning a completed workflow makes RPC.Init reject it, leaving the
++		// task to be resubmitted again when its lease expires.
++		log.Warn().Str("state", string(workflow.State)).Msgf("pull queue item: %s: workflow already terminal, dropping stale task", task.ID)
++		if dropErr := q.Queue.Done(c, task.ID, workflow.State); dropErr != nil {
++			log.Error().Err(dropErr).Msgf("pull queue item: %s: failed to drop terminal task", task.ID)
+ 		}
++		return nil
+ 	}
+-	return task, err
++	return task
+ }
+ 
+ // Done signals the task is complete.
+diff --git a/server/queue/persistent_concurrency_test.go b/server/queue/persistent_concurrency_test.go
+new file mode 100644
+index 00000000..0b9b92d8
+--- /dev/null
++++ b/server/queue/persistent_concurrency_test.go
+@@ -0,0 +1,204 @@
++// Copyright 2026 Woodpecker Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package queue
++
++import (
++	"context"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"go.woodpecker-ci.org/woodpecker/v3/server/model"
++	store_mocks "go.woodpecker-ci.org/woodpecker/v3/server/store/mocks"
++	"go.woodpecker-ci.org/woodpecker/v3/server/store/types"
++)
++
++// Poll creates its cancellation context while holding the FIFO mutex, before
++// registering its worker. Once both contexts have been observed, Info acquires
++// that mutex to confirm registration completed before dispatch resumes.
++type persistentPollRegistrationContext struct {
++	context.Context
++	registered chan struct{}
++	once       sync.Once
++}
++
++func (c *persistentPollRegistrationContext) Done() <-chan struct{} {
++	c.once.Do(func() { close(c.registered) })
++	return c.Context.Done()
++}
++
++func TestPersistentQueueExpiryAssignsOnlyOneRecoveryPoller(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++	defer cancel()
++	q, ok := NewMemoryQueue(ctx).(*fifo)
++	require.True(t, ok)
++	store := store_mocks.NewMockStore(t)
++	task := genDummyTask()
++	store.EXPECT().TaskInsert(task).Return(nil).Once()
++	store.EXPECT().TaskDelete("1").Return(nil).Once()
++	store.EXPECT().TaskDelete("1").Return(types.ErrRecordNotExist).Times(2)
++	store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusRunning}, nil).Twice()
++	pq := &persistentQueue{Queue: q, store: store}
++	require.NoError(t, pq.PushAtOnce(ctx, []*model.Task{task}))
++	assigned, err := pq.Poll(ctx, 1, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, assigned)
++	oldWaiter := expirePersistentLease(t, ctx, q, "1")
++	require.Equal(t, 1, q.Info(ctx).Stats.Pending)
++
++	q.Pause()
++	pollCtx, stopPollers := context.WithCancelCause(ctx)
++	defer stopPollers(nil)
++	type pollResult struct {
++		agentID int64
++		task    *model.Task
++		err     error
++	}
++	results := make(chan pollResult, 2)
++	registrations := make([]*persistentPollRegistrationContext, 0, 2)
++	for _, agentID := range []int64{2, 3} {
++		registration := &persistentPollRegistrationContext{
++			Context:    pollCtx,
++			registered: make(chan struct{}),
++		}
++		registrations = append(registrations, registration)
++		go func() {
++			got, pollErr := pq.Poll(registration, agentID, filterFnTrue)
++			results <- pollResult{agentID: agentID, task: got, err: pollErr}
++		}()
++	}
++	for _, registration := range registrations {
++		select {
++		case <-registration.registered:
++		case <-ctx.Done():
++			t.Fatal("recovery poller did not register")
++		}
++	}
++	require.Equal(t, 2, q.Info(ctx).Stats.Workers)
++	q.Resume()
++
++	var winner pollResult
++	select {
++	case winner = <-results:
++	case <-ctx.Done():
++		t.Fatal("no poller recovered the expired task")
++	}
++	require.NoError(t, winner.err)
++	require.NotNil(t, winner.task)
++	require.Equal(t, task.ID, winner.task.ID)
++	require.Equal(t, winner.agentID, winner.task.AgentID)
++	info := q.Info(ctx)
++	require.Equal(t, 1, info.Stats.Running)
++	require.Equal(t, 1, info.Stats.Workers)
++	require.Zero(t, info.Stats.Pending)
++
++	stopPollers(nil)
++	select {
++	case loser := <-results:
++		require.NotEqual(t, winner.agentID, loser.agentID)
++		require.Nil(t, loser.task, "one expiry must create only one new assignment")
++		require.ErrorIs(t, loser.err, context.Canceled)
++	case <-ctx.Done():
++		t.Fatal("unassigned poller did not return after cancellation")
++	}
++	require.NoError(t, pq.Done(ctx, task.ID, model.StatusSuccess))
++	select {
++	case waitErr := <-oldWaiter:
++		require.ErrorIs(t, waitErr, ErrTaskExpired)
++	case <-ctx.Done():
++		t.Fatal("expired generation waiter did not return")
++	}
++	info = q.Info(ctx)
++	require.Zero(t, info.Stats.Workers)
++	require.Zero(t, info.Stats.Pending)
++	require.Zero(t, info.Stats.Running)
++	require.Zero(t, info.Stats.WaitingOnDeps)
++}
++
++func TestPersistentQueueCancelExpiredPendingPreservesOtherTasks(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++	defer cancel()
++	q, ok := NewMemoryQueue(ctx).(*fifo)
++	require.True(t, ok)
++	store := store_mocks.NewMockStore(t)
++	expired := &model.Task{
++		ID: "1", PipelineID: 1, Created: 1,
++		ConcurrencyGroup: "repo:deploy", ConcurrencyLimit: 1,
++	}
++	dependent := &model.Task{
++		ID: "2", PipelineID: 1,
++		Dependencies: []string{"1"},
++		DepStatus:    make(map[string]model.StatusValue),
++		RunOn:        []string{"success", "failure"},
++	}
++	unrelated := &model.Task{
++		ID: "3", PipelineID: 2, Created: 2,
++		ConcurrencyGroup: "repo:deploy", ConcurrencyLimit: 1,
++	}
++	for _, task := range []*model.Task{expired, dependent, unrelated} {
++		store.EXPECT().TaskInsert(task).Return(nil).Once()
++		store.EXPECT().TaskDelete(task.ID).Return(nil).Once()
++		store.EXPECT().TaskDelete(task.ID).Return(types.ErrRecordNotExist).Once()
++	}
++	store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusRunning}, nil).Once()
++	store.EXPECT().WorkflowLoad(int64(2)).Return(&model.Workflow{ID: 2, State: model.StatusPending}, nil).Once()
++	store.EXPECT().WorkflowLoad(int64(3)).Return(&model.Workflow{ID: 3, State: model.StatusPending}, nil).Once()
++	pq := &persistentQueue{Queue: q, store: store}
++	require.NoError(t, pq.PushAtOnce(ctx, []*model.Task{expired, dependent, unrelated}))
++	assigned, err := pq.Poll(ctx, 1, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, assigned)
++	require.Equal(t, expired.ID, assigned.ID)
++	oldWaiter := expirePersistentLease(t, ctx, q, expired.ID)
++
++	q.Lock()
++	reserved := !q.canRunConcurrent(unrelated)
++	q.Unlock()
++	require.True(t, reserved, "the expired pending task must retain its concurrency reservation")
++	require.NoError(t, pq.ErrorAtOnce(ctx, []string{expired.ID}, ErrCancel))
++	q.Lock()
++	released := q.canRunConcurrent(unrelated)
++	dependencyStatus := dependent.DepStatus[expired.ID]
++	q.Unlock()
++	require.True(t, released, "cancellation must free the expired task's reservation")
++	require.Equal(t, model.StatusKilled, dependencyStatus)
++
++	got, err := pq.Poll(ctx, 2, func(task *model.Task) (bool, int) {
++		return task.ID == unrelated.ID, 1
++	})
++	require.NoError(t, err)
++	require.NotNil(t, got)
++	require.Equal(t, unrelated.ID, got.ID)
++	require.NoError(t, pq.Done(ctx, got.ID, model.StatusSuccess))
++	got, err = pq.Poll(ctx, 3, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, got)
++	require.Equal(t, dependent.ID, got.ID, "the canceled task must not reappear")
++	require.Equal(t, model.StatusKilled, got.DepStatus[expired.ID])
++	require.NoError(t, pq.Done(ctx, got.ID, model.StatusSuccess))
++	select {
++	case waitErr := <-oldWaiter:
++		require.ErrorIs(t, waitErr, ErrTaskExpired)
++	case <-ctx.Done():
++		t.Fatal("expired generation waiter did not return")
++	}
++	info := q.Info(ctx)
++	require.Zero(t, info.Stats.Workers)
++	require.Zero(t, info.Stats.Pending)
++	require.Zero(t, info.Stats.Running)
++	require.Zero(t, info.Stats.WaitingOnDeps)
++}
+diff --git a/server/queue/persistent_fallback_test.go b/server/queue/persistent_fallback_test.go
+new file mode 100644
+index 00000000..96b263dd
+--- /dev/null
++++ b/server/queue/persistent_fallback_test.go
+@@ -0,0 +1,75 @@
++// Copyright 2026 Woodpecker Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package queue
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	"go.woodpecker-ci.org/woodpecker/v3/server/model"
++	store_mocks "go.woodpecker-ci.org/woodpecker/v3/server/store/mocks"
++)
++
++type wrappedPollTestQueue struct {
++	Queue
++	task      *model.Task
++	err       error
++	doneID    string
++	doneState model.StatusValue
++}
++
++func (q *wrappedPollTestQueue) Poll(context.Context, int64, func(*model.Task) (bool, int)) (*model.Task, error) {
++	return q.task, q.err
++}
++
++func (q *wrappedPollTestQueue) Done(_ context.Context, id string, state model.StatusValue) error {
++	q.doneID, q.doneState = id, state
++	return nil
++}
++
++// WithTaskStore can wrap queues other than FIFO. A partial Poll result must
++// still be validated, without losing the wrapped queue's error for live work.
++func TestPersistentQueueWrappedPollError(t *testing.T) {
++	for _, state := range []model.StatusValue{model.StatusPending, model.StatusCanceled, "no-task"} {
++		t.Run(string(state), func(t *testing.T) {
++			ctx := t.Context()
++			store := store_mocks.NewMockStore(t)
++			pollErr := errors.New("wrapped queue poll error")
++			var task *model.Task
++			if state != "no-task" {
++				task = genDummyTask()
++				store.EXPECT().TaskDelete(task.ID).Return(nil).Once()
++				store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: state}, nil).Once()
++			}
++			q := &wrappedPollTestQueue{task: task, err: pollErr}
++			pq := &persistentQueue{Queue: q, store: store}
++
++			got, err := pq.Poll(ctx, 7, filterFnTrue)
++			if state == model.StatusCanceled {
++				assert.Nil(t, got, "stale partial results must still be removed")
++				assert.NoError(t, err)
++				assert.Equal(t, task.ID, q.doneID)
++				assert.Equal(t, state, q.doneState)
++			} else {
++				assert.Same(t, task, got)
++				assert.ErrorIs(t, err, pollErr)
++				assert.Empty(t, q.doneID)
++			}
++		})
++	}
++}
+diff --git a/server/queue/persistent_lease_budget_test.go b/server/queue/persistent_lease_budget_test.go
+new file mode 100644
+index 00000000..fbc4afd0
+--- /dev/null
++++ b/server/queue/persistent_lease_budget_test.go
+@@ -0,0 +1,83 @@
++// Copyright 2026 Woodpecker Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build test
++
++package queue
++
++import (
++	"context"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"go.woodpecker-ci.org/woodpecker/v3/server/model"
++)
++
++func TestPersistentSQLiteLeaseRetryBudgetSurvivesRestartAndTerminates(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
++	defer cancel()
++	path := filepath.Join(t.TempDir(), "lease-budget.sqlite")
++
++	s, closeStore := openQueueSQLiteStore(t, ctx, path)
++	q, memory, stop := newSQLitePersistentQueue(t, ctx, s)
++	task := createQueueSQLiteWorkflow(t, s, model.StatusRunning)
++	require.NoError(t, q.PushAtOnce(ctx, []*model.Task{task}))
++
++	first, err := q.Poll(ctx, 1, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, first)
++	require.Equal(t, 1, first.LeaseAttempts)
++	expireQueueSQLiteTask(t, ctx, memory, task.ID)
++	requireQueueSQLiteBackupCount(t, s, 1)
++
++	stop()
++	closeStore()
++	s, _ = openQueueSQLiteStore(t, ctx, path)
++	q, memory, _ = newSQLitePersistentQueue(t, ctx, s)
++	require.Equal(t, 1, q.Info(ctx).Stats.Pending)
++
++	second, err := q.Poll(ctx, 2, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, second)
++	require.Equal(t, 2, second.LeaseAttempts)
++	expireQueueSQLiteTask(t, ctx, memory, task.ID)
++	requireQueueSQLiteBackupCount(t, s, 1)
++
++	third, err := q.Poll(ctx, 3, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, third)
++	require.Equal(t, 3, third.LeaseAttempts)
++
++	memory.Lock()
++	current := memory.running[task.ID]
++	require.NotNil(t, current)
++	current.deadline = time.Now().Add(-time.Second)
++	memory.Unlock()
++	select {
++	case <-current.done:
++		require.ErrorIs(t, current.error, ErrTaskExpired)
++	case <-ctx.Done():
++		t.Fatal("expired lease did not reach terminal state")
++	}
++
++	requireQueueSQLiteEmpty(t, ctx, q, s)
++	workflow, err := s.WorkflowLoad(1)
++	require.NoError(t, err)
++	require.Equal(t, model.StatusFailure, workflow.State)
++	require.True(t, strings.Contains(workflow.Error, "3 assignments"), workflow.Error)
++}
+diff --git a/server/queue/persistent_recovery_test.go b/server/queue/persistent_recovery_test.go
+new file mode 100644
+index 00000000..4c7f29fc
+--- /dev/null
++++ b/server/queue/persistent_recovery_test.go
+@@ -0,0 +1,365 @@
++// Copyright 2026 Woodpecker Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package queue
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.woodpecker-ci.org/woodpecker/v3/server/model"
++	store_mocks "go.woodpecker-ci.org/woodpecker/v3/server/store/mocks"
++	"go.woodpecker-ci.org/woodpecker/v3/server/store/types"
++)
++
++type persistentValidationResult struct {
++	task *model.Task
++	err  error
++}
++
++// Wait evaluates Done after capturing its running entry. This handshake lets
++// the test expire that lease only after the waiter has registered for it.
++type registeredWaitContext struct {
++	context.Context
++	registered chan struct{}
++}
++
++func (c registeredWaitContext) Done() <-chan struct{} {
++	close(c.registered)
++	return c.Context.Done()
++}
++
++func withWaitRegistration(ctx context.Context) (context.Context, <-chan struct{}) {
++	registered := make(chan struct{})
++	return registeredWaitContext{Context: ctx, registered: registered}, registered
++}
++
++func expirePersistentLease(t *testing.T, ctx context.Context, q *fifo, id string) <-chan error {
++	t.Helper()
++	waitCtx, registered := withWaitRegistration(ctx)
++	waitResult := make(chan error, 1)
++	q.Lock()
++	agentID := q.running[id].item.AgentID
++	q.Unlock()
++	go func(waitCtx context.Context) { waitResult <- q.Wait(waitCtx, agentID, id) }(waitCtx)
++	select {
++	case <-registered:
++	case <-ctx.Done():
++		t.Fatal("waiter did not register")
++	}
++
++	q.Lock()
++	old := q.running[id]
++	old.deadline = time.Now().Add(-time.Second)
++	q.Unlock()
++	select {
++	case <-old.done:
++	case <-ctx.Done():
++		t.Fatal("lease did not expire")
++	}
++	return waitResult
++}
++
++func TestPersistentQueueRecoversExpiredLease(t *testing.T) {
++	for _, state := range []model.StatusValue{model.StatusPending, model.StatusRunning} {
++		t.Run(string(state), func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++			defer cancel()
++			q, ok := NewMemoryQueue(ctx).(*fifo)
++			require.True(t, ok)
++			store := store_mocks.NewMockStore(t)
++			task := genDummyTask()
++			store.EXPECT().TaskInsert(task).Return(nil).Once()
++			store.EXPECT().TaskDelete("1").Return(nil).Once()
++			store.EXPECT().TaskDelete("1").Return(types.ErrRecordNotExist).Times(3)
++			store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: state}, nil).Times(3)
++			pq := &persistentQueue{Queue: q, store: store}
++			require.NoError(t, pq.PushAtOnce(ctx, []*model.Task{task}))
++			got, err := pq.Poll(ctx, 1, filterFnTrue)
++			require.NoError(t, err)
++			require.NotNil(t, got)
++
++			for agentID := int64(2); agentID <= 3; agentID++ {
++				oldWaiter := expirePersistentLease(t, ctx, q, "1")
++				assert.Equal(t, 1, q.Info(ctx).Stats.Pending)
++				got, err = pq.Poll(ctx, agentID, filterFnTrue)
++				require.NoError(t, err)
++				require.NotNil(t, got, "missing backup must not drop an expired live workflow")
++				assert.Equal(t, agentID, got.AgentID)
++				select {
++				case waitErr := <-oldWaiter:
++					assert.ErrorIs(t, waitErr, ErrTaskExpired)
++				case <-ctx.Done():
++					t.Fatal("old lease waiter did not return")
++				}
++				assert.Equal(t, 1, q.Info(ctx).Stats.Running)
++			}
++			require.NoError(t, pq.Done(ctx, "1", model.StatusSuccess))
++			assert.Zero(t, q.Info(ctx).Stats.Pending)
++			assert.Zero(t, q.Info(ctx).Stats.Running)
++		})
++	}
++}
++
++func TestPersistentQueueMissingBackupFiltersStaleWorkflows(t *testing.T) {
++	states := []model.StatusValue{
++		model.StatusSuccess, model.StatusFailure, model.StatusKilled,
++		model.StatusCanceled, model.StatusSkipped, model.StatusError,
++		model.StatusDeclined, "missing",
++	}
++	for _, state := range states {
++		t.Run(string(state), func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++			defer cancel()
++			q, ok := NewMemoryQueue(ctx).(*fifo)
++			require.True(t, ok)
++			store := store_mocks.NewMockStore(t)
++			store.EXPECT().TaskDelete("1").Return(types.ErrRecordNotExist).Once()
++			if state == "missing" {
++				store.EXPECT().WorkflowLoad(int64(1)).Return(nil, types.ErrRecordNotExist).Once()
++			} else {
++				store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: state}, nil).Once()
++			}
++			pq := &persistentQueue{Queue: q, store: store}
++			require.NoError(t, q.PushAtOnce(ctx, []*model.Task{genDummyTask()}))
++			got, err := pq.Poll(ctx, 1, filterFnTrue)
++			require.NoError(t, err)
++			assert.Nil(t, got)
++			assert.Zero(t, q.Info(ctx).Stats.Pending)
++			assert.Zero(t, q.Info(ctx).Stats.Running)
++		})
++	}
++}
++
++func TestPersistentQueuePollRejectsCanceledAssignment(t *testing.T) {
++	for _, backupMissing := range []bool{false, true} {
++		name := "present"
++		if backupMissing {
++			name = "missing"
++		}
++		t.Run(name, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++			defer cancel()
++			q, ok := NewMemoryQueue(ctx).(*fifo)
++			require.True(t, ok)
++			store := store_mocks.NewMockStore(t)
++			validating, release := make(chan struct{}), make(chan struct{})
++			unblock := sync.OnceFunc(func() { close(release) })
++			defer unblock()
++			var deleteErr error
++			if backupMissing {
++				deleteErr = types.ErrRecordNotExist
++			}
++			store.EXPECT().TaskDelete("1").Run(func(string) {
++				close(validating)
++				select {
++				case <-release:
++				case <-ctx.Done():
++				}
++			}).Return(deleteErr).Once()
++			store.EXPECT().TaskDelete("1").Return(types.ErrRecordNotExist).Once()
++			// CancelWorkflows evicts first; a running workflow is not marked
++			// terminal until the agent stops. Its DB state can still be Running.
++			store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusRunning}, nil).Maybe()
++			pq := &persistentQueue{Queue: q, store: store}
++			require.NoError(t, q.PushAtOnce(ctx, []*model.Task{genDummyTask()}))
++			result := make(chan persistentValidationResult, 1)
++			pollDone := make(chan struct{})
++			go func() {
++				defer close(pollDone)
++				got, err := pq.Poll(ctx, 1, filterFnTrue)
++				result <- persistentValidationResult{got, err}
++			}()
++			defer func() {
++				unblock()
++				select {
++				case <-pollDone:
++				case <-ctx.Done():
++				}
++			}()
++			select {
++			case <-validating:
++			case <-ctx.Done():
++				t.Fatal("Poll did not reach storage validation")
++			}
++			// This must complete while storage is blocked: validation cannot
++			// hold the FIFO mutex or resurrect this canceled assignment.
++			canceled := make(chan error, 1)
++			go func() { canceled <- pq.ErrorAtOnce(ctx, []string{"1"}, ErrCancel) }()
++			select {
++			case cancelErr := <-canceled:
++				require.NoError(t, cancelErr)
++				require.NoError(t, ctx.Err(), "cancellation must finish before storage is released")
++			case <-ctx.Done():
++				t.Fatal("cancellation blocked on storage validation")
++			}
++			unblock()
++			select {
++			case got := <-result:
++				require.NoError(t, got.err)
++				assert.Nil(t, got.task)
++			case <-ctx.Done():
++				t.Fatal("Poll did not return")
++			}
++			assert.Zero(t, q.Info(ctx).Stats.Running)
++		})
++	}
++}
++
++func TestPersistentQueuePollRejectsReplacedLease(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
++	defer cancel()
++	q, ok := NewMemoryQueue(ctx).(*fifo)
++	require.True(t, ok)
++	store := store_mocks.NewMockStore(t)
++	validating, release := make(chan struct{}), make(chan struct{})
++	unblock := sync.OnceFunc(func() { close(release) })
++	defer unblock()
++	store.EXPECT().TaskDelete("1").Run(func(string) {
++		close(validating)
++		select {
++		case <-release:
++		case <-ctx.Done():
++		}
++	}).Return(nil).Once()
++	store.EXPECT().TaskDelete("1").Return(types.ErrRecordNotExist).Times(2)
++	store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusRunning}, nil).Maybe()
++	pq := &persistentQueue{Queue: q, store: store}
++	require.NoError(t, q.PushAtOnce(ctx, []*model.Task{genDummyTask()}))
++	oldResult := make(chan persistentValidationResult, 1)
++	pollDone := make(chan struct{})
++	go func() {
++		defer close(pollDone)
++		got, err := pq.Poll(ctx, 1, filterFnTrue)
++		oldResult <- persistentValidationResult{got, err}
++	}()
++	defer func() {
++		unblock()
++		select {
++		case <-pollDone:
++		case <-ctx.Done():
++		}
++	}()
++	select {
++	case <-validating:
++	case <-ctx.Done():
++		t.Fatal("Poll did not reach storage validation")
++	}
++	oldWaiter := expirePersistentLease(t, ctx, q, "1")
++	// The same agent may acquire a new lease while the previous Poll is
++	// blocked. Checking only task ID and agent ID would accept both results.
++	got, err := pq.Poll(ctx, 1, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, got)
++	unblock()
++	select {
++	case old := <-oldResult:
++		require.NoError(t, old.err)
++		assert.Nil(t, old.task)
++	case <-ctx.Done():
++		t.Fatal("old Poll did not return")
++	}
++	select {
++	case waitErr := <-oldWaiter:
++		assert.ErrorIs(t, waitErr, ErrTaskExpired)
++	case <-ctx.Done():
++		t.Fatal("old lease waiter did not return")
++	}
++	assert.Equal(t, 1, q.Info(ctx).Stats.Running)
++	require.NoError(t, pq.Done(ctx, "1", model.StatusSuccess))
++}
++
++func TestPersistentQueueTransientStoreErrorsDoNotDropTask(t *testing.T) {
++	for _, stage := range []string{"delete", "load"} {
++		t.Run(stage, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++			defer cancel()
++			q, ok := NewMemoryQueue(ctx).(*fifo)
++			require.True(t, ok)
++			store := store_mocks.NewMockStore(t)
++			transient := errors.New("temporary database failure")
++			if stage == "delete" {
++				store.EXPECT().TaskDelete("1").Return(transient).Once()
++				store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusRunning}, nil).Maybe()
++			} else {
++				store.EXPECT().TaskDelete("1").Return(types.ErrRecordNotExist).Once()
++				store.EXPECT().WorkflowLoad(int64(1)).Return(nil, transient).Once()
++			}
++			pq := &persistentQueue{Queue: q, store: store}
++			require.NoError(t, q.PushAtOnce(ctx, []*model.Task{genDummyTask()}))
++			got, err := pq.Poll(ctx, 1, filterFnTrue)
++			require.NoError(t, err)
++			require.NotNil(t, got, "transient store failure must not complete the lease as stale")
++			assert.Equal(t, 1, q.Info(ctx).Stats.Running)
++		})
++	}
++}
++
++func TestPersistentQueueMissingBackupRejectsInvalidWorkflowID(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++	defer cancel()
++	q, ok := NewMemoryQueue(ctx).(*fifo)
++	require.True(t, ok)
++	store := store_mocks.NewMockStore(t)
++	store.EXPECT().TaskDelete("invalid").Return(types.ErrRecordNotExist).Once()
++	pq := &persistentQueue{Queue: q, store: store}
++	require.NoError(t, q.PushAtOnce(ctx, []*model.Task{{ID: "invalid"}}))
++	got, err := pq.Poll(ctx, 1, filterFnTrue)
++	require.NoError(t, err)
++	assert.Nil(t, got)
++	assert.Zero(t, q.Info(ctx).Stats.Running)
++}
++
++func TestPersistentQueueCanceledPollReturns(t *testing.T) {
++	ctx, cancel := context.WithCancelCause(t.Context())
++	q, ok := NewMemoryQueue(ctx).(*fifo)
++	require.True(t, ok)
++	store := store_mocks.NewMockStore(t)
++	pq := &persistentQueue{Queue: q, store: store}
++	cancel(nil)
++	got, err := pq.Poll(ctx, 1, filterFnTrue)
++	assert.ErrorIs(t, err, context.Canceled)
++	assert.Nil(t, got)
++	assert.Zero(t, q.Info(ctx).Stats.Workers)
++}
++
++func TestPersistentQueueDeleteErrorStillFiltersStaleWorkflow(t *testing.T) {
++	for _, state := range []model.StatusValue{model.StatusCanceled, "missing"} {
++		t.Run(string(state), func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
++			defer cancel()
++			q, ok := NewMemoryQueue(ctx).(*fifo)
++			require.True(t, ok)
++			store := store_mocks.NewMockStore(t)
++			store.EXPECT().TaskDelete("1").Return(errors.New("temporary delete failure")).Once()
++			if state == "missing" {
++				store.EXPECT().WorkflowLoad(int64(1)).Return(nil, types.ErrRecordNotExist).Once()
++			} else {
++				store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: state}, nil).Once()
++			}
++			pq := &persistentQueue{Queue: q, store: store}
++			require.NoError(t, q.PushAtOnce(ctx, []*model.Task{genDummyTask()}))
++			got, err := pq.Poll(ctx, 1, filterFnTrue)
++			require.NoError(t, err)
++			assert.Nil(t, got, "a failed backup delete must not bypass known stale workflow state")
++			assert.Zero(t, q.Info(ctx).Stats.Running)
++		})
++	}
++}
+diff --git a/server/queue/persistent_sqlite_test.go b/server/queue/persistent_sqlite_test.go
+new file mode 100644
+index 00000000..9886cff3
+--- /dev/null
++++ b/server/queue/persistent_sqlite_test.go
+@@ -0,0 +1,249 @@
++// Copyright 2026 Woodpecker Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//go:build test
++
++package queue
++
++import (
++	"context"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"go.woodpecker-ci.org/woodpecker/v3/server/model"
++	"go.woodpecker-ci.org/woodpecker/v3/server/store"
++	"go.woodpecker-ci.org/woodpecker/v3/server/store/datastore"
++)
++
++func openQueueSQLiteStore(t *testing.T, ctx context.Context, path string) (store.Store, func()) {
++	t.Helper()
++
++	s, err := datastore.NewEngine(&store.Opts{
++		Driver: "sqlite3",
++		Config: path,
++		XORM: store.XORM{
++			MaxOpenConns: 1,
++			MaxIdleConns: 1,
++		},
++	})
++	require.NoError(t, err)
++
++	closed := false
++	closeStore := func() {
++		t.Helper()
++		if !closed {
++			closed = true
++			require.NoError(t, s.Close())
++		}
++	}
++	t.Cleanup(closeStore)
++	require.NoError(t, s.Ping())
++	require.NoError(t, s.Migrate(ctx, true))
++	return s, closeStore
++}
++
++func newSQLitePersistentQueue(t *testing.T, ctx context.Context, s store.Store) (Queue, *fifo, context.CancelFunc) {
++	t.Helper()
++
++	queueCtx, cancel := context.WithCancelCause(ctx)
++	stop := func() { cancel(nil) }
++	t.Cleanup(stop)
++	memory, ok := NewMemoryQueue(queueCtx).(*fifo)
++	require.True(t, ok)
++	return WithTaskStore(queueCtx, memory, s), memory, stop
++}
++
++func createQueueSQLiteWorkflow(t *testing.T, s store.Store, state model.StatusValue) *model.Task {
++	t.Helper()
++
++	require.NoError(t, s.WorkflowsCreate([]*model.Workflow{{
++		ID:         1,
++		PipelineID: 1,
++		PID:        1,
++		State:      state,
++	}}))
++	return genDummyTask()
++}
++
++func requireQueueSQLiteBackupCount(t *testing.T, s store.Store, count int) {
++	t.Helper()
++
++	tasks, err := s.TaskList()
++	require.NoError(t, err)
++	require.Len(t, tasks, count)
++}
++
++func requireQueueSQLiteEmpty(t *testing.T, ctx context.Context, q Queue, s store.Store) {
++	t.Helper()
++
++	info := q.Info(ctx)
++	require.Zero(t, info.Stats.Pending)
++	require.Zero(t, info.Stats.Running)
++	require.Zero(t, info.Stats.WaitingOnDeps)
++	requireQueueSQLiteBackupCount(t, s, 0)
++}
++
++func expireQueueSQLiteTask(t *testing.T, ctx context.Context, q *fifo, id string) {
++	t.Helper()
++
++	q.Lock()
++	expired := q.running[id]
++	if expired != nil {
++		expired.deadline = time.Now().Add(-time.Second)
++	}
++	q.Unlock()
++	require.NotNil(t, expired)
++
++	// Let the normal process loop expire the selected lease. Waiting on this
++	// generation's channel avoids changing queue-wide timing or sleeping.
++	select {
++	case <-expired.done:
++		require.ErrorIs(t, expired.error, ErrTaskExpired)
++	case <-ctx.Done():
++		t.Fatal("queue did not expire the selected task before the context ended")
++	}
++
++	info := q.Info(ctx)
++	require.Equal(t, 1, info.Stats.Pending)
++	require.Zero(t, info.Stats.Running)
++}
++
++func TestPersistentQueueSQLiteRestoresQueuedTask(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
++	defer cancel()
++	path := filepath.Join(t.TempDir(), "queue.sqlite")
++
++	s, closeStore := openQueueSQLiteStore(t, ctx, path)
++	q, _, stop := newSQLitePersistentQueue(t, ctx, s)
++	task := createQueueSQLiteWorkflow(t, s, model.StatusPending)
++	require.NoError(t, q.PushAtOnce(ctx, []*model.Task{task}))
++	requireQueueSQLiteBackupCount(t, s, 1)
++
++	stop()
++	closeStore()
++	s, _ = openQueueSQLiteStore(t, ctx, path)
++	q, _, _ = newSQLitePersistentQueue(t, ctx, s)
++	require.Equal(t, 1, q.Info(ctx).Stats.Pending)
++	requireQueueSQLiteBackupCount(t, s, 1)
++
++	restored, err := q.Poll(ctx, 2, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, restored)
++	require.Equal(t, task.ID, restored.ID)
++	require.Equal(t, task.Data, restored.Data)
++	requireQueueSQLiteBackupCount(t, s, 0)
++	require.NoError(t, q.Done(ctx, restored.ID, model.StatusSuccess))
++	requireQueueSQLiteEmpty(t, ctx, q, s)
++}
++
++func TestPersistentQueueSQLiteDoesNotRestoreAssignedTask(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
++	defer cancel()
++	path := filepath.Join(t.TempDir(), "queue.sqlite")
++
++	s, closeStore := openQueueSQLiteStore(t, ctx, path)
++	q, _, stop := newSQLitePersistentQueue(t, ctx, s)
++	task := createQueueSQLiteWorkflow(t, s, model.StatusRunning)
++	require.NoError(t, q.PushAtOnce(ctx, []*model.Task{task}))
++	assigned, err := q.Poll(ctx, 1, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, assigned)
++	require.Equal(t, 1, q.Info(ctx).Stats.Running)
++	requireQueueSQLiteBackupCount(t, s, 0)
++
++	stop()
++	closeStore()
++	s, _ = openQueueSQLiteStore(t, ctx, path)
++	q, _, _ = newSQLitePersistentQueue(t, ctx, s)
++	requireQueueSQLiteEmpty(t, ctx, q, s)
++	workflow, err := s.WorkflowLoad(1)
++	require.NoError(t, err)
++	require.Equal(t, model.StatusRunning, workflow.State)
++}
++
++func TestPersistentQueueSQLiteRestoresExpiredPendingTask(t *testing.T) {
++	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
++	defer cancel()
++	path := filepath.Join(t.TempDir(), "queue.sqlite")
++
++	s, closeStore := openQueueSQLiteStore(t, ctx, path)
++	q, memory, stop := newSQLitePersistentQueue(t, ctx, s)
++	task := createQueueSQLiteWorkflow(t, s, model.StatusRunning)
++	require.NoError(t, q.PushAtOnce(ctx, []*model.Task{task}))
++	assigned, err := q.Poll(ctx, 1, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, assigned)
++	expireQueueSQLiteTask(t, ctx, memory, task.ID)
++	requireQueueSQLiteBackupCount(t, s, 1)
++	tasks, err := s.TaskList()
++	require.NoError(t, err)
++	require.Equal(t, 1, tasks[0].LeaseAttempts)
++
++	// Expiry is durable: restart must restore both the pending task and its
++	// assignment count so the retry budget cannot reset with the process.
++	stop()
++	closeStore()
++	s, _ = openQueueSQLiteStore(t, ctx, path)
++	q, _, _ = newSQLitePersistentQueue(t, ctx, s)
++	require.Equal(t, 1, q.Info(ctx).Stats.Pending)
++	requireQueueSQLiteBackupCount(t, s, 1)
++	restored, err := q.Poll(ctx, 2, filterFnTrue)
++	require.NoError(t, err)
++	require.NotNil(t, restored)
++	require.Equal(t, 2, restored.LeaseAttempts)
++	requireQueueSQLiteBackupCount(t, s, 0)
++	require.NoError(t, q.Done(ctx, restored.ID, model.StatusSuccess))
++	requireQueueSQLiteEmpty(t, ctx, q, s)
++	workflow, err := s.WorkflowLoad(1)
++	require.NoError(t, err)
++	require.Equal(t, model.StatusRunning, workflow.State)
++}
++
++func TestPersistentQueueSQLiteRecoversExpiredTask(t *testing.T) {
++	for _, state := range []model.StatusValue{model.StatusPending, model.StatusRunning} {
++		t.Run(string(state), func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
++			defer cancel()
++
++			s, _ := openQueueSQLiteStore(t, ctx, filepath.Join(t.TempDir(), "queue.sqlite"))
++			q, memory, _ := newSQLitePersistentQueue(t, ctx, s)
++			task := createQueueSQLiteWorkflow(t, s, state)
++			require.NoError(t, q.PushAtOnce(ctx, []*model.Task{task}))
++			requireQueueSQLiteBackupCount(t, s, 1)
++
++			assigned, err := q.Poll(ctx, 1, filterFnTrue)
++			require.NoError(t, err)
++			require.NotNil(t, assigned)
++			requireQueueSQLiteBackupCount(t, s, 0)
++			expireQueueSQLiteTask(t, ctx, memory, task.ID)
++			requireQueueSQLiteBackupCount(t, s, 1)
++			tasks, err := s.TaskList()
++			require.NoError(t, err)
++			require.Equal(t, 1, tasks[0].LeaseAttempts)
++
++			recovered, err := q.Poll(ctx, 2, filterFnTrue)
++			require.NoError(t, err)
++			require.NotNil(t, recovered, "an expired nonterminal task must survive its missing backup")
++			require.Equal(t, task.ID, recovered.ID)
++			require.EqualValues(t, 2, recovered.AgentID)
++			require.Equal(t, 2, recovered.LeaseAttempts)
++			require.Equal(t, 1, q.Info(ctx).Stats.Running)
++			require.NoError(t, q.Done(ctx, recovered.ID, model.StatusSuccess))
++			requireQueueSQLiteEmpty(t, ctx, q, s)
++		})
++	}
++}
+diff --git a/server/queue/persistent_test.go b/server/queue/persistent_test.go
+index 95bf5858..11955bd5 100644
+--- a/server/queue/persistent_test.go
++++ b/server/queue/persistent_test.go
+@@ -24,8 +24,8 @@ import (
+ 	"go.woodpecker-ci.org/woodpecker/v3/server/store/types"
+ )
+ 
+-// A task that lingers in the in-memory queue but is already gone from the
+-// backup store must be dropped on Poll instead of being handed to the agent,
++// A task that lingers in memory after its workflow was canceled and its backup
++// removed must be dropped on Poll instead of being handed to the agent,
+ // otherwise it loops forever (re-poll, illegal-instruction, resubmit).
+ func TestPersistentQueuePollDropsStaleTask(t *testing.T) {
+ 	ctx, cancel, q := setupTestQueue(t)
+@@ -33,6 +33,7 @@ func TestPersistentQueuePollDropsStaleTask(t *testing.T) {
+ 
+ 	store := store_mocks.NewMockStore(t)
+ 	store.EXPECT().TaskDelete("1").Return(types.ErrRecordNotExist).Once()
++	store.EXPECT().WorkflowLoad(int64(1)).Return(&model.Workflow{ID: 1, State: model.StatusCanceled}, nil).Once()
+ 
+ 	pq := &persistentQueue{Queue: q, store: store}
+ 
+diff --git a/server/queue/queue.go b/server/queue/queue.go
+index f57bf271..25fc5f5c 100644
+--- a/server/queue/queue.go
++++ b/server/queue/queue.go
+@@ -126,9 +126,17 @@ type Queue interface {
+ 	// If still pending they will just get removed from the queue.
+ 	ErrorAtOnce(c context.Context, ids []string, err error) error
+ 
+-	// Wait waits until the task is complete.
+-	// Also signals via error ErrCancel if workflow got canceled.
+-	Wait(c context.Context, id string) error
++	// Wait waits until the task leased to the agent is complete.
++	// It signals ErrCancel if the workflow got canceled, ErrTaskExpired if
++	// the lease expired and the task is queued again, ErrAgentMissMatch if
++	// another agent holds the lease now, and returns nil for a task the
++	// queue does not know, so agents outlive a server restart.
++	Wait(c context.Context, agentID int64, id string) error
++
++	// Leased checks whether the agent holds the lease of the task: nil if it
++	// does, ErrTaskExpired or ErrAgentMissMatch if it lost it, ErrNotFound
++	// for a task the queue does not know.
++	Leased(c context.Context, agentID int64, id string) error
+ 
+ 	// Info returns internal queue information.
+ 	Info(c context.Context) InfoT
+diff --git a/server/rpc/errors.go b/server/rpc/errors.go
+index 351a68a4..d6398bc3 100644
+--- a/server/rpc/errors.go
++++ b/server/rpc/errors.go
+@@ -24,6 +24,7 @@ var (
+ 
+ 	ErrAgentIllegalRepo            = errors.New("agent is not allowed to interact with repo")
+ 	ErrAgentIllegalWorkflowAgentID = errors.New("agent is not allowed to interact with workflow where it's id is not already locked")
++	ErrAgentLostLease              = errors.New("agent no longer holds the lease of the workflow")
+ 
+ 	ErrAgentImpossibleWorkflowState = errors.New("agent reported an impossible workflow state, the agent is probably outdated and speaks an incompatible protocol")
+ )
+diff --git a/server/rpc/rpc.go b/server/rpc/rpc.go
+index f962a6b5..304114ad 100644
+--- a/server/rpc/rpc.go
++++ b/server/rpc/rpc.go
+@@ -117,12 +117,17 @@ func (s *RPC) Wait(c context.Context, workflowID string) (canceled bool, err err
+ 		return false, err
+ 	}
+ 
+-	if err := s.scheduler.Wait(c, workflowID); err != nil {
++	if err := s.scheduler.Wait(c, agent.ID, workflowID); err != nil {
+ 		if errors.Is(err, queue.ErrCancel) {
+ 			// we explicit send a cancel signal
+ 			log.Debug().Str("workflowID", workflowID).Msg("while waiting the queue reported the workflow as canceled")
+ 			return true, nil
+ 		}
++		if errors.Is(err, queue.ErrTaskExpired) || errors.Is(err, queue.ErrAgentMissMatch) {
++			// the lease is gone, the agent stops its run on this error
++			log.Warn().Err(err).Int64("agentID", agent.ID).Str("workflowID", workflowID).Msg("agent lost the lease of the workflow while waiting")
++			return false, fmt.Errorf("%w: %w", ErrAgentLostLease, err)
++		}
+ 		// unknown error happened
+ 		log.Error().Err(err).Str("workflowID", workflowID).Msg("while waiting the queue returned an unexpected error")
+ 		return false, err
+@@ -201,6 +206,9 @@ func (s *RPC) Update(c context.Context, strWorkflowID string, state rpc.StepStat
+ 	if err := s.checkAgentPermissionByWorkflow(c, agent, strWorkflowID, currentPipeline, repo); err != nil {
+ 		return err
+ 	}
++	if err := s.checkAgentLease(c, agent, strWorkflowID); err != nil {
++		return err
++	}
+ 
+ 	// sanitize agent input: only allow step updates that the workflow state permits
+ 	if err := checkWorkflowAllowsStepUpdate(workflow.State, step, state); err != nil {
+@@ -276,6 +284,9 @@ func (s *RPC) Init(c context.Context, strWorkflowID string, state rpc.WorkflowSt
+ 	if err := s.checkAgentPermissionByWorkflow(c, agent, strWorkflowID, currentPipeline, repo); err != nil {
+ 		return err
+ 	}
++	if err := s.checkAgentLease(c, agent, strWorkflowID); err != nil {
++		return err
++	}
+ 
+ 	// check workflow's own state to prevent re-initializing a finished or blocked workflow
+ 	if err := checkWorkflowState(workflow.State); err != nil {
+@@ -351,6 +362,9 @@ func (s *RPC) Done(c context.Context, strWorkflowID string, state rpc.WorkflowSt
+ 	if err := s.checkAgentPermissionByWorkflow(c, agent, strWorkflowID, currentPipeline, repo); err != nil {
+ 		return err
+ 	}
++	if err := s.checkAgentLease(c, agent, strWorkflowID); err != nil {
++		return err
++	}
+ 
+ 	// check workflow's own state to prevent finishing an already-finished or blocked workflow
+ 	if err := checkWorkflowState(workflow.State); err != nil {
+@@ -578,6 +592,19 @@ func (s *RPC) ReportHealth(ctx context.Context, status string) error {
+ 	return s.store.AgentUpdate(agent)
+ }
+ 
++// checkAgentLease rejects an agent whose lease of the workflow's task expired
++// or moved to another agent, so a slow agent cannot act on a workflow that was
++// handed out again. A task the queue does not know, for example after a server
++// restart, is left to the store based ownership check.
++func (s *RPC) checkAgentLease(c context.Context, agent *model.Agent, workflowID string) error {
++	err := s.scheduler.Leased(c, agent.ID, workflowID)
++	if err == nil || errors.Is(err, queue.ErrNotFound) {
++		return nil
++	}
++	log.Warn().Err(err).Int64("agentID", agent.ID).Str("workflowID", workflowID).Msg("agent does not hold the lease of the workflow")
++	return fmt.Errorf("%w: %w", ErrAgentLostLease, err)
++}
++
+ func (s *RPC) completeChildrenIfParentCompleted(completedWorkflow *model.Workflow, finished int64) {
+ 	for _, c := range completedWorkflow.Children {
+ 		if c.Running() {
+diff --git a/server/rpc/rpc_integration_test.go b/server/rpc/rpc_integration_test.go
+index 5cc4e32b..2c85aaf9 100644
+--- a/server/rpc/rpc_integration_test.go
++++ b/server/rpc/rpc_integration_test.go
+@@ -53,6 +53,14 @@ func newTestRPC(t *testing.T, mockStore *store_mocks.MockStore, q queue.Queue) R
+ 		Name:      "pipeline_count_" + t.Name(),
+ 	}, []string{"repo", "branch", "status", "pipeline"})
+ 
++	if q == nil {
++		// Init, Update and Done ask the queue who holds the lease; a queue that
++		// does not know the workflow leaves it to the store based ownership check.
++		mockQueue := queue_mocks.NewMockQueue(t)
++		mockQueue.On("Leased", mock.Anything, mock.Anything, mock.Anything).Return(queue.ErrNotFound).Maybe()
++		q = mockQueue
++	}
++
+ 	return RPC{
+ 		store:         mockStore,
+ 		scheduler:     scheduler.NewScheduler(t.Context(), mockStore, q, memory.New()),
+@@ -475,6 +483,7 @@ func TestRPCDone(t *testing.T) {
+ 		mockStore.On("GetUser", mock.Anything).Return(nil, errors.New("user not found"))
+ 		mockStore.On("AgentUpdate", mock.Anything).Return(nil)
+ 		mockQueue.On("Done", mock.Anything, mock.Anything, mock.Anything).Return(nil)
++		mockQueue.On("Leased", mock.Anything, mock.Anything, mock.Anything).Return(queue.ErrNotFound).Maybe()
+ 
+ 		rpcInst := newTestRPC(t, mockStore, mockQueue)
+ 		ctx := context.WithValue(t.Context(), agentIDKey, int64(1))
+@@ -508,6 +517,7 @@ func TestRPCDone(t *testing.T) {
+ 		mockStore.On("GetUser", mock.Anything).Return(nil, errors.New("user not found"))
+ 		mockStore.On("AgentUpdate", mock.Anything).Return(nil)
+ 		mockQueue.On("Done", mock.Anything, mock.Anything, mock.Anything).Return(nil)
++		mockQueue.On("Leased", mock.Anything, mock.Anything, mock.Anything).Return(queue.ErrNotFound).Maybe()
+ 
+ 		rpcInst := newTestRPC(t, mockStore, mockQueue)
+ 		ctx := context.WithValue(t.Context(), agentIDKey, int64(1))
+diff --git a/server/rpc/rpc_lease_test.go b/server/rpc/rpc_lease_test.go
+new file mode 100644
+index 00000000..8aae4eb3
+--- /dev/null
++++ b/server/rpc/rpc_lease_test.go
+@@ -0,0 +1,140 @@
++//go:build test
++
++// Copyright 2026 Woodpecker Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package rpc
++
++import (
++	"context"
++	"encoding/json"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"go.woodpecker-ci.org/woodpecker/v3/rpc"
++	"go.woodpecker-ci.org/woodpecker/v3/server/logging"
++	"go.woodpecker-ci.org/woodpecker/v3/server/model"
++	"go.woodpecker-ci.org/woodpecker/v3/server/pubsub/memory"
++	"go.woodpecker-ci.org/woodpecker/v3/server/queue"
++	"go.woodpecker-ci.org/woodpecker/v3/server/scheduler"
++	"go.woodpecker-ci.org/woodpecker/v3/server/store"
++	"go.woodpecker-ci.org/woodpecker/v3/server/store/datastore"
++	"go.woodpecker-ci.org/woodpecker/v3/shared/constant"
++)
++
++// A slow agent whose lease expired before it got past Next must not run the
++// workflow next to the agent that picked it up again. Regression for the
++// duplicate run reported on #7152: with the real store, RPC and persistent
++// queue, agent A's Wait and Init are rejected once the task is pending again,
++// agent B runs it alone, and A cannot finish it.
++func TestRPCStaleAgentLosesLeaseAfterExpiry(t *testing.T) {
++	orig := constant.TaskTimeout
++	constant.TaskTimeout = 300 * time.Millisecond
++	t.Cleanup(func() { constant.TaskTimeout = orig })
++
++	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
++	defer cancel()
++
++	s, err := datastore.NewEngine(&store.Opts{Driver: "sqlite3", Config: filepath.Join(t.TempDir(), "lease.sqlite"), XORM: store.XORM{MaxOpenConns: 1, MaxIdleConns: 1}})
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = s.Close() })
++	require.NoError(t, s.Migrate(ctx, true))
++
++	for _, a := range []*model.Agent{{Name: "A", OrgID: model.IDNotSet, Token: "a"}, {Name: "B", OrgID: model.IDNotSet, Token: "b"}} {
++		require.NoError(t, s.AgentCreate(a))
++	}
++	repo := &model.Repo{UserID: 4242, ForgeRemoteID: "1", FullName: "o/r", Owner: "o", Name: "r", OrgID: 1}
++	require.NoError(t, s.CreateRepo(repo))
++	pl := &model.Pipeline{RepoID: repo.ID, Status: model.StatusPending, Number: 1}
++	require.NoError(t, s.CreatePipeline(pl))
++	wf := &model.Workflow{PipelineID: pl.ID, PID: 1, State: model.StatusPending, Name: "wf", Children: []*model.Step{
++		{UUID: "step-1", PipelineID: pl.ID, PID: 2, PPID: 1, Name: "build", State: model.StatusPending},
++	}}
++	require.NoError(t, s.WorkflowsCreate([]*model.Workflow{wf}))
++
++	q, err := queue.New(ctx, queue.Config{Backend: queue.TypeMemory, Store: s})
++	require.NoError(t, err)
++	r := RPC{
++		store:         s,
++		scheduler:     scheduler.NewScheduler(ctx, s, q, memory.New()),
++		logger:        logging.New(),
++		pipelineTime:  prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "lease_t"}, []string{"repo", "branch", "status", "pipeline"}),
++		pipelineCount: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "lease_c"}, []string{"repo", "branch", "status", "pipeline"}),
++	}
++
++	wfID := "1"
++	data, err := json.Marshal(rpc.Workflow{ID: wfID})
++	require.NoError(t, err)
++	require.NoError(t, q.PushAtOnce(ctx, []*model.Task{{ID: wfID, Data: data, Labels: map[string]string{"platform": "x"}}}))
++
++	ctxA := context.WithValue(ctx, agentIDKey, int64(1))
++	ctxB := context.WithValue(ctx, agentIDKey, int64(2))
++	filter := rpc.Filter{Labels: map[string]string{"platform": "x"}}
++
++	got, err := r.Next(ctxA, filter)
++	require.NoError(t, err)
++	require.NotNil(t, got)
++
++	// A's Next took longer than the lease: the task is pending again before A
++	// continues with its run.
++	require.Eventually(t, func() bool { return q.Info(ctx).Stats.Pending == 1 }, 5*time.Second, 10*time.Millisecond)
++
++	waitCtx, waitCancel := context.WithTimeout(ctxA, 2*time.Second)
++	canceled, err := r.Wait(waitCtx, wfID)
++	waitCancel()
++	assert.False(t, canceled)
++	require.ErrorIs(t, err, ErrAgentLostLease)
++	require.ErrorIs(t, err, queue.ErrTaskExpired)
++
++	err = r.Init(ctxA, wfID, rpc.WorkflowState{Started: time.Now().Unix()})
++	require.ErrorIs(t, err, ErrAgentLostLease)
++
++	// The store still locks the workflow to A, only the queue knows the lease
++	// is gone: A can neither report a step nor finish the workflow.
++	err = r.Update(ctxA, wfID, rpc.StepState{StepUUID: "step-1", Started: time.Now().Unix()})
++	require.ErrorIs(t, err, ErrAgentLostLease)
++	err = r.Done(ctxA, wfID, rpc.WorkflowState{Started: 1, Finished: time.Now().Unix()})
++	require.ErrorIs(t, err, ErrAgentLostLease)
++
++	nextCtx, nextCancel := context.WithTimeout(ctxB, 5*time.Second)
++	gotB, err := r.Next(nextCtx, filter)
++	nextCancel()
++	require.NoError(t, err)
++	require.NotNil(t, gotB)
++	assert.Equal(t, wfID, gotB.ID)
++	require.NoError(t, r.Init(ctxB, wfID, rpc.WorkflowState{Started: time.Now().Unix()}))
++
++	// B holds the lease and the workflow lock now: A can neither wait on nor
++	// finish the workflow. The store check fires first, the queue check backs it.
++	waitCtx, waitCancel = context.WithTimeout(ctxA, 2*time.Second)
++	_, err = r.Wait(waitCtx, wfID)
++	waitCancel()
++	require.ErrorIs(t, err, ErrAgentIllegalWorkflowAgentID)
++	require.ErrorIs(t, r.scheduler.Leased(ctxA, 1, wfID), queue.ErrAgentMissMatch)
++	err = r.Done(ctxA, wfID, rpc.WorkflowState{Started: 1, Finished: time.Now().Unix()})
++	require.ErrorIs(t, err, ErrAgentIllegalWorkflowAgentID)
++
++	require.NoError(t, r.Done(ctxB, wfID, rpc.WorkflowState{Started: 1, Finished: time.Now().Unix()}))
++	w, err := s.WorkflowLoad(1)
++	require.NoError(t, err)
++	assert.Equal(t, model.StatusSuccess, w.State)
++	assert.Equal(t, int64(2), w.AgentID)
++	assert.Equal(t, 0, q.Info(ctx).Stats.Running)
++	assert.Equal(t, 0, q.Info(ctx).Stats.Pending)
++}
+diff --git a/server/rpc/sanitize.go b/server/rpc/sanitize.go
+index d7da9142..221b0a14 100644
+--- a/server/rpc/sanitize.go
++++ b/server/rpc/sanitize.go
+@@ -82,6 +82,27 @@ func (s *RPC) lockAgentToWorkflow(_ context.Context, agent *model.Agent, strWork
+ 		return err
+ 	}
+ 
++	if workflow.AgentID != 0 && workflow.AgentID != agent.ID && workflow.Running() {
++		steps, err := s.store.StepListFromWorkflowFind(workflow)
++		if err != nil {
++			return err
++		}
++		for _, step := range steps {
++			step.State = model.StatusPending
++			step.Error = ""
++			step.ExitCode = 0
++			step.Started = 0
++			step.Finished = 0
++			if err := s.store.StepUpdate(step); err != nil {
++				return err
++			}
++		}
++		workflow.State = model.StatusPending
++		workflow.Error = ""
++		workflow.Started = 0
++		workflow.Finished = 0
++	}
++
+ 	workflow.AgentID = agent.ID
+ 	return s.store.WorkflowUpdate(workflow)
+ }
+diff --git a/server/scheduler/impl.go b/server/scheduler/impl.go
+index d41ba2ae..ffb47ddb 100644
+--- a/server/scheduler/impl.go
++++ b/server/scheduler/impl.go
+@@ -94,8 +94,12 @@ func (p *impl) Resume() {
+ 	p.q.Resume()
+ }
+ 
+-func (p *impl) Wait(c context.Context, id string) error {
+-	return p.q.Wait(c, id)
++func (p *impl) Wait(c context.Context, agentID int64, id string) error {
++	return p.q.Wait(c, agentID, id)
++}
++
++func (p *impl) Leased(c context.Context, agentID int64, id string) error {
++	return p.q.Leased(c, agentID, id)
+ }
+ 
+ //
+diff --git a/server/scheduler/mocks/mock_Scheduler.go b/server/scheduler/mocks/mock_Scheduler.go
+index 74f54fd4..266059ae 100644
+--- a/server/scheduler/mocks/mock_Scheduler.go
++++ b/server/scheduler/mocks/mock_Scheduler.go
+@@ -387,6 +387,69 @@ func (_c *MockScheduler_KickAgentWorkers_Call) RunAndReturn(run func(agentID int
+ 	return _c
+ }
+ 
++// Leased provides a mock function for the type MockScheduler
++func (_mock *MockScheduler) Leased(c context.Context, agentID int64, id string) error {
++	ret := _mock.Called(c, agentID, id)
++
++	if len(ret) == 0 {
++		panic("no return value specified for Leased")
++	}
++
++	var r0 error
++	if returnFunc, ok := ret.Get(0).(func(context.Context, int64, string) error); ok {
++		r0 = returnFunc(c, agentID, id)
++	} else {
++		r0 = ret.Error(0)
++	}
++	return r0
++}
++
++// MockScheduler_Leased_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'Leased'
++type MockScheduler_Leased_Call struct {
++	*mock.Call
++}
++
++// Leased is a helper method to define mock.On call
++//   - c context.Context
++//   - agentID int64
++//   - id string
++func (_e *MockScheduler_Expecter) Leased(c any, agentID any, id any) *MockScheduler_Leased_Call {
++	return &MockScheduler_Leased_Call{Call: _e.mock.On("Leased", c, agentID, id)}
++}
++
++func (_c *MockScheduler_Leased_Call) Run(run func(c context.Context, agentID int64, id string)) *MockScheduler_Leased_Call {
++	_c.Call.Run(func(args mock.Arguments) {
++		var arg0 context.Context
++		if args[0] != nil {
++			arg0 = args[0].(context.Context)
++		}
++		var arg1 int64
++		if args[1] != nil {
++			arg1 = args[1].(int64)
++		}
++		var arg2 string
++		if args[2] != nil {
++			arg2 = args[2].(string)
++		}
++		run(
++			arg0,
++			arg1,
++			arg2,
++		)
++	})
++	return _c
++}
++
++func (_c *MockScheduler_Leased_Call) Return(err error) *MockScheduler_Leased_Call {
++	_c.Call.Return(err)
++	return _c
++}
++
++func (_c *MockScheduler_Leased_Call) RunAndReturn(run func(c context.Context, agentID int64, id string) error) *MockScheduler_Leased_Call {
++	_c.Call.Return(run)
++	return _c
++}
++
+ // Pause provides a mock function for the type MockScheduler
+ func (_mock *MockScheduler) Pause() {
+ 	_mock.Called()
+@@ -729,16 +792,16 @@ func (_c *MockScheduler_Subscribe_Call) RunAndReturn(run func(c context.Context,
+ }
+ 
+ // Wait provides a mock function for the type MockScheduler
+-func (_mock *MockScheduler) Wait(c context.Context, id string) error {
+-	ret := _mock.Called(c, id)
++func (_mock *MockScheduler) Wait(c context.Context, agentID int64, id string) error {
++	ret := _mock.Called(c, agentID, id)
+ 
+ 	if len(ret) == 0 {
+ 		panic("no return value specified for Wait")
+ 	}
+ 
+ 	var r0 error
+-	if returnFunc, ok := ret.Get(0).(func(context.Context, string) error); ok {
+-		r0 = returnFunc(c, id)
++	if returnFunc, ok := ret.Get(0).(func(context.Context, int64, string) error); ok {
++		r0 = returnFunc(c, agentID, id)
+ 	} else {
+ 		r0 = ret.Error(0)
+ 	}
+@@ -752,24 +815,30 @@ type MockScheduler_Wait_Call struct {
+ 
+ // Wait is a helper method to define mock.On call
+ //   - c context.Context
++//   - agentID int64
+ //   - id string
+-func (_e *MockScheduler_Expecter) Wait(c any, id any) *MockScheduler_Wait_Call {
+-	return &MockScheduler_Wait_Call{Call: _e.mock.On("Wait", c, id)}
++func (_e *MockScheduler_Expecter) Wait(c any, agentID any, id any) *MockScheduler_Wait_Call {
++	return &MockScheduler_Wait_Call{Call: _e.mock.On("Wait", c, agentID, id)}
+ }
+ 
+-func (_c *MockScheduler_Wait_Call) Run(run func(c context.Context, id string)) *MockScheduler_Wait_Call {
++func (_c *MockScheduler_Wait_Call) Run(run func(c context.Context, agentID int64, id string)) *MockScheduler_Wait_Call {
+ 	_c.Call.Run(func(args mock.Arguments) {
+ 		var arg0 context.Context
+ 		if args[0] != nil {
+ 			arg0 = args[0].(context.Context)
+ 		}
+-		var arg1 string
++		var arg1 int64
+ 		if args[1] != nil {
+-			arg1 = args[1].(string)
++			arg1 = args[1].(int64)
++		}
++		var arg2 string
++		if args[2] != nil {
++			arg2 = args[2].(string)
+ 		}
+ 		run(
+ 			arg0,
+ 			arg1,
++			arg2,
+ 		)
+ 	})
+ 	return _c
+@@ -780,7 +849,7 @@ func (_c *MockScheduler_Wait_Call) Return(err error) *MockScheduler_Wait_Call {
+ 	return _c
+ }
+ 
+-func (_c *MockScheduler_Wait_Call) RunAndReturn(run func(c context.Context, id string) error) *MockScheduler_Wait_Call {
++func (_c *MockScheduler_Wait_Call) RunAndReturn(run func(c context.Context, agentID int64, id string) error) *MockScheduler_Wait_Call {
+ 	_c.Call.Return(run)
+ 	return _c
+ }
+diff --git a/server/scheduler/scheduler.go b/server/scheduler/scheduler.go
+index 7a2d8016..f21615d0 100644
+--- a/server/scheduler/scheduler.go
++++ b/server/scheduler/scheduler.go
+@@ -46,7 +46,8 @@ type Scheduler interface {
+ 	Extend(c context.Context, agentID int64, workflowID string) error
+ 	Done(c context.Context, id string, exitStatus model.StatusValue) error
+ 	Error(c context.Context, id string, err error) error
+-	Wait(c context.Context, id string) error
++	Wait(c context.Context, agentID int64, id string) error
++	Leased(c context.Context, agentID int64, id string) error
+ 	Info(c context.Context) queue.InfoT
+ 	Pause()
+ 	Resume()

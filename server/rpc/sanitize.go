@@ -82,6 +82,27 @@ func (s *RPC) lockAgentToWorkflow(_ context.Context, agent *model.Agent, strWork
 		return err
 	}
 
+	if workflow.AgentID != 0 && workflow.AgentID != agent.ID && workflow.Running() {
+		steps, err := s.store.StepListFromWorkflowFind(workflow)
+		if err != nil {
+			return err
+		}
+		for _, step := range steps {
+			step.State = model.StatusPending
+			step.Error = ""
+			step.ExitCode = 0
+			step.Started = 0
+			step.Finished = 0
+			if err := s.store.StepUpdate(step); err != nil {
+				return err
+			}
+		}
+		workflow.State = model.StatusPending
+		workflow.Error = ""
+		workflow.Started = 0
+		workflow.Finished = 0
+	}
+
 	workflow.AgentID = agent.ID
 	return s.store.WorkflowUpdate(workflow)
 }
