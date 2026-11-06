@@ -1,0 +1,20 @@
+when:
+  - event: push
+  - event: pull_request
+
+steps:
+  source-main-check:
+    image: docker.io/golang:1.27-bookworm
+    pull: false
+    commands:
+      - |
+        set -eu
+        go version
+        test -s go.mod
+        test -s server/forge/github/github.go
+        test ! -e .woodpecker/docker.yaml
+        count="$(find .woodpecker -maxdepth 1 -type f -name '*.yaml' | wc -l | tr -d '[:space:]')"
+        test "$count" = "1"
+        test -z "$(gofmt -l server/forge/github/github.go)"
+        git diff --check
+        echo "WOODPECKER_MAIN_SOURCE_CHECK=PASS"
