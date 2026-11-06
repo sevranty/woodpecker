@@ -159,5 +159,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-[executed on device: MacBook-Pro-RYMAR.local (2d5f874e-53fd-420e-b5c6-9b6fa434aa7b)]
