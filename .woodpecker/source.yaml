@@ -17,5 +17,13 @@ steps:
         test ! -e .woodpecker/docker.yaml
         test "$(find .woodpecker -maxdepth 1 -type f -name '*.yaml' | wc -l)" -eq 1
         test -z "$(gofmt -l server/forge/github/github.go server/forge/github/branch_cache.go server/forge/github/branch_cache_test.go server/forge/github/github_branch_cache_integration_test.go server/forge/github/wfo882_status_identity.go server/forge/github/wfo882_status_identity_test.go)"
+        test -s maintenance/upgrade/scripts/upgrade.py
+        test -s maintenance/upgrade/tests/test_upgrade.py
+        if grep -Fq '[executed on device:' maintenance/upgrade/scripts/upgrade.py maintenance/upgrade/tests/test_upgrade.py; then
+          echo "CONTAMINATED_UPGRADE_SOURCE=FAIL"
+          exit 1
+        fi
+        python3 -m py_compile maintenance/upgrade/scripts/upgrade.py maintenance/upgrade/tests/test_upgrade.py
+        python3 -m unittest discover -s maintenance/upgrade/tests -p 'test_upgrade.py'
         git diff --check
         echo "WOODPECKER_SOURCE_ONLY_CHECK=PASS"
