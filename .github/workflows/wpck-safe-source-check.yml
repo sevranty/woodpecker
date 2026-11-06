@@ -1,0 +1,67 @@
+name: WPCK safe source-only tests
+
+on:
+  push:
+    branches:
+      - wpck-13-source-only-woodpecker-ci-v319
+      - wpck-v3.19.0
+  pull_request:
+    branches:
+      - wpck-v3.19.0
+
+permissions: {}
+
+jobs:
+  exact-go-source:
+    name: Source Go 1.27 unit, race, vet and config safety
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      GOTOOLCHAIN: local
+      GOMAXPROCS: "2"
+    steps:
+      - name: Fetch exact public source without credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q source
+          git -C source remote add origin https://github.com/sevranty/woodpecker.git
+          git -C source fetch -q --no-tags --depth=1 origin "$GITHUB_REF"
+          git -C source checkout -q --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C source status --porcelain)"
+          echo "EXACT_SOURCE_HEAD=$GITHUB_SHA"
+
+      - name: Install SHA-verified official Go 1.27.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 2 --connect-timeout 15 \
+            https://go.dev/dl/go1.27.0.linux-amd64.tar.gz \
+            -o "$RUNNER_TEMP/go1.27.0.linux-amd64.tar.gz"
+          echo "675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685  $RUNNER_TEMP/go1.27.0.linux-amd64.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/official-go"
+          tar -xzf "$RUNNER_TEMP/go1.27.0.linux-amd64.tar.gz" -C "$RUNNER_TEMP/official-go"
+          "$RUNNER_TEMP/official-go/go/bin/go" version
+          echo "$RUNNER_TEMP/official-go/go/bin" >> "$GITHUB_PATH"
+
+      - name: Source tests and security admission
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(find .woodpecker -maxdepth 1 -type f -name '*.yaml' | wc -l)" -eq 1
+          test -f .woodpecker/source.yaml
+          test ! -f .woodpecker/docker.yaml
+          if grep -Eiq '(from_secret|privileged|buildx|publish|deploy|docker[.]sock)' .woodpecker/source.yaml; then
+            echo "Disallowed source-only CI feature" >&2
+            exit 1
+          fi
+          go test -count=1 -p 2 -timeout=180s ./server/forge/github
+          go test -race -count=1 -p 2 -timeout=180s ./server/forge/github
+          go vet -p 2 ./server/forge/github
+          test -z "$(gofmt -l server/forge/github/github.go server/forge/github/branch_cache.go server/forge/github/branch_cache_test.go server/forge/github/github_branch_cache_integration_test.go server/forge/github/wfo882_status_identity.go server/forge/github/wfo882_status_identity_test.go)"
+          git diff --check
+          test -z "$(git status --porcelain)"
+          echo "EXACT_SOURCE_ONLY_HOSTED=PASS:$GITHUB_SHA"

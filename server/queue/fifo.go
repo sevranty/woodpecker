@@ -37,20 +37,22 @@ type entry struct {
 type worker struct {
 	agentID int64
 	filter  func(*model.Task) (bool, int)
-	channel chan *model.Task
+	channel chan *entry
 	stop    context.CancelCauseFunc
 }
 
 type fifo struct {
 	sync.Mutex
 
-	ctx           context.Context
-	workers       map[*worker]struct{}
-	running       map[string]*entry
-	pending       *list.List
-	waitingOnDeps *list.List
-	extension     time.Duration
-	paused        bool
+	ctx            context.Context
+	workers        map[*worker]struct{}
+	running        map[string]*entry
+	pending        *list.List
+	waitingOnDeps  *list.List
+	extension      time.Duration
+	paused         bool
+	maxAssignments int
+	onLeaseExpired func(*model.Task, bool) error
 }
 
 // processTimeInterval is the time till the queue rearranges things,
@@ -84,12 +86,19 @@ func (q *fifo) PushAtOnce(_ context.Context, tasks []*model.Task) error {
 
 // Poll retrieves and removes a task head of this queue.
 func (q *fifo) Poll(c context.Context, agentID int64, filter func(*model.Task) (bool, int)) (*model.Task, error) {
+	return q.pollWithValidation(c, agentID, filter, nil)
+}
+
+// pollWithValidation validates an assignment outside the queue lock, then checks
+// that cancellation or expiry did not remove or replace that exact lease while
+// validation was in progress.
+func (q *fifo) pollWithValidation(c context.Context, agentID int64, filter func(*model.Task) (bool, int), validate func(*model.Task) *model.Task) (*model.Task, error) {
 	q.Lock()
 	ctx, stop := context.WithCancelCause(c)
 
 	w := &worker{
 		agentID: agentID,
-		channel: make(chan *model.Task, 1),
+		channel: make(chan *entry, 1),
 		filter:  filter,
 		stop:    stop,
 	}
@@ -103,8 +112,18 @@ func (q *fifo) Poll(c context.Context, agentID int64, filter func(*model.Task) (
 			delete(q.workers, w)
 			q.Unlock()
 			return nil, ctx.Err()
-		case t := <-w.channel:
-			return t, nil
+		case assigned := <-w.channel:
+			task := assigned.item
+			if validate != nil {
+				task = validate(task)
+			}
+			q.Lock()
+			current := q.running[assigned.item.ID] == assigned
+			q.Unlock()
+			if !current {
+				return nil, nil
+			}
+			return task, nil
 		}
 	}
 }
@@ -158,27 +177,79 @@ func (q *fifo) finished(ids []string, exitStatus model.StatusValue, err error) e
 	return errors.Join(errs...)
 }
 
-// Wait waits until the item is done executing.
-// Also signals via error ErrCancel if workflow got canceled.
-func (q *fifo) Wait(ctx context.Context, taskID string) error {
+// Wait waits until the item leased to the agent is done executing.
+// Also signals via error ErrCancel if workflow got canceled, ErrTaskExpired
+// if the task is queued again and ErrAgentMissMatch if another agent holds
+// the lease, so a slow agent stops instead of running next to the new one.
+func (q *fifo) Wait(ctx context.Context, agentID int64, taskID string) error {
 	q.Lock()
-	state := q.running[taskID]
+	state, err := q.leaseOf(agentID, taskID)
 	q.Unlock()
-	if state != nil {
-		select {
-		case <-ctx.Done():
-		case <-state.done:
-			// check if we have a wrapped cancel error and unwrap it
-			if errors.Is(state.error, ErrCancel) {
-				return ErrCancel
-			}
-			// or return queue errors and no workflow errors
-			if !errors.Is(state.error, new(ErrExternal)) {
-				return state.error
-			}
+	if err != nil || state == nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+	case <-state.done:
+		// check if we have a wrapped cancel error and unwrap it
+		if errors.Is(state.error, ErrCancel) {
+			return ErrCancel
+		}
+		// or return queue errors and no workflow errors
+		if !errors.Is(state.error, new(ErrExternal)) {
+			return state.error
 		}
 	}
 	return nil
+}
+
+// Leased reports whether the agent holds the lease of the task.
+func (q *fifo) Leased(_ context.Context, agentID int64, taskID string) error {
+	q.Lock()
+	defer q.Unlock()
+
+	state, err := q.leaseOf(agentID, taskID)
+	if err != nil {
+		return err
+	}
+	if state == nil {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// leaseOf returns the running entry of the task if the agent holds its lease.
+// A task that is pending or waiting on dependencies again lost its lease
+// (ErrTaskExpired), one running under another agent was handed out again
+// (ErrAgentMissMatch), and one the queue does not know gives nil, nil.
+// Expects the queue to be locked by the caller.
+func (q *fifo) leaseOf(agentID int64, taskID string) (*entry, error) {
+	if state, ok := q.running[taskID]; ok {
+		if state.item.AgentID != agentID {
+			return nil, ErrAgentMissMatch
+		}
+		return state, nil
+	}
+	if q.queued(taskID) {
+		return nil, ErrTaskExpired
+	}
+	return nil, nil
+}
+
+// queued reports whether the task is pending or waiting on dependencies.
+// Expects the queue to be locked by the caller.
+func (q *fifo) queued(taskID string) bool {
+	for element := q.pending.Front(); element != nil; element = element.Next() {
+		if task, _ := element.Value.(*model.Task); task.ID == taskID {
+			return true
+		}
+	}
+	for element := q.waitingOnDeps.Front(); element != nil; element = element.Next() {
+		if task, _ := element.Value.(*model.Task); task.ID == taskID {
+			return true
+		}
+	}
+	return false
 }
 
 // Extend extends the task execution deadline.
@@ -271,6 +342,7 @@ func (q *fifo) process() {
 		q.filterWaiting()
 		for pending, worker := q.assignToWorker(); pending != nil && worker != nil; pending, worker = q.assignToWorker() {
 			task, _ := pending.Value.(*model.Task)
+			task.LeaseAttempts++
 			task.AgentID = worker.agentID
 			delete(q.workers, worker)
 			q.pending.Remove(pending)
@@ -279,7 +351,7 @@ func (q *fifo) process() {
 				done:     make(chan bool),
 				deadline: time.Now().Add(q.extension),
 			}
-			worker.channel <- task
+			worker.channel <- q.running[task.ID]
 		}
 		q.Unlock()
 	}
@@ -435,11 +507,24 @@ func taskOrderLess(a, b *model.Task) bool {
 func (q *fifo) resubmitExpiredPipelines() {
 	for taskID, taskState := range q.running {
 		if time.Now().After(taskState.deadline) {
-			log.Info().Str("task_id", taskID).Msg("queue: resubmitting expired task")
+			exhausted := q.maxAssignments > 0 && taskState.item.LeaseAttempts >= q.maxAssignments
+			if q.onLeaseExpired != nil {
+				if err := q.onLeaseExpired(taskState.item, exhausted); err != nil {
+					log.Error().Err(err).Str("task_id", taskID).Msg("queue: failed to persist expired lease transition")
+					taskState.deadline = time.Now().Add(q.extension)
+					continue
+				}
+			}
 			taskState.error = ErrTaskExpired
-			q.pending.PushFront(taskState.item)
 			delete(q.running, taskID)
 			close(taskState.done)
+			if exhausted {
+				log.Error().Str("task_id", taskID).Int("assignments", taskState.item.LeaseAttempts).Msg("queue: lease retry budget exhausted")
+				q.updateDepStatusInQueue(taskID, model.StatusFailure)
+				continue
+			}
+			log.Info().Str("task_id", taskID).Int("assignments", taskState.item.LeaseAttempts).Msg("queue: resubmitting expired task")
+			q.pending.PushFront(taskState.item)
 		}
 	}
 }

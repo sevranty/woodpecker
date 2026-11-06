@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "upstream_target_sha": "3f1bb0bd0db28e410ad797034d75780116122c91",
+  "checks": [
+    {
+      "source": "WFO-319-redispatch/upstream-pr7152-v3.19.0.patch",
+      "sha256": "65ddfa189619e4dc23c6c5cddee80d1975f20524447750bf298eb90ee620e4fa",
+      "status": "APPLIES_CLEANLY",
+      "errors": []
+    },
+    {
+      "source": "WFO-319-redispatch/rpc-lease-test-compat.patch",
+      "sha256": "fc7aa4eb9ed1cbc5a39767451f1d93891fa73d01d88336a15661ec092a20716e",
+      "status": "APPLIES_CLEANLY",
+      "errors": []
+    },
+    {
+      "source": "WFO-319-redispatch/wfo773-reset-steps-on-redispatch.patch",
+      "sha256": "762e74da4131f8b028d48a8e2dc29e64f747dd50a8644b24f06876b04a0b0ced",
+      "status": "APPLIES_CLEANLY",
+      "errors": []
+    },
+    {
+      "source": "WFO-319-redispatch/wfo773-bounded-retries.patch",
+      "sha256": "b66e8775627bf83d8bf96c03557f9422d0ec9cff10b4496ce832de7c8e38e599",
+      "status": "ADAPTED_AND_TESTED",
+      "errors": [],
+      "adaptation": "WPCK#21: preserve 3.20.1 pause-state restore and queue validation; add lease retry budget with SQLite persistence, source-only"
+    }
+  ],
+  "decision": "WPCK#21 LOCAL_SOURCE_PASS: all four historical queue patches ported; pending independent exact HEAD tests and protected release",
+  "source": "https://github.com/sevranty/web-factory-os/issues/771",
+  "exact_upstream_queue_suite": "PASS on Mac with Go 1.27.0: ./server/queue ./server/scheduler ./server/rpc",
+  "result_patch_path": "maintenance/upgrade/patches/queue-lease-recovery.patch",
+  "result_patch_sha256": "b06b2f6cf14a4e3d0ea5eeb988540cfd09963fb12ec6a029dd46d42ba8ea56dc",
+  "verification": {
+    "go1.27_queue_scheduler_rpc": "PASS",
+    "sqlite_restart_and_bounded_retry": "PASS",
+    "sqlite_bounded_retry_race": "PASS",
+    "go_vet": "PASS",
+    "github_exact_head": "PENDING",
+    "live_release": "NOT_AUTHORIZED",
+    "go1.27_full_queue_scheduler_rpc_with_sqlite_build_tag": "PASS",
+    "go1.27_full_race_queue_scheduler_rpc_with_sqlite_build_tag": "PASS",
+    "patch_applies_to_wpck16_exact_source": "PASS"
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "release": "v3.20.1",
+  "upstream_sha": "3f1bb0bd0db28e410ad797034d75780116122c91",
+  "source_baseline": "3f6a236dba3981889103fe11a0b30e7522839120",
+  "owning_issue": "WPCK#16",
+  "umbrella_issue": "WFO#1016",
+  "status": "candidate-source-not-deployed",
+  "module_results": [
+    {
+      "id": "github-branch-cache",
+      "result": "applied-clean"
+    },
+    {
+      "id": "github-status-route",
+      "result": "applied-clean",
+      "enabled": false
+    },
+    {
+      "id": "github-http-metrics",
+      "result": "applied-3way-with-reviewed-go-github-v93-import"
+    },
+    {
+      "id": "source-ci",
+      "result": "applied-clean"
+    },
+    {
+      "id": "queue-lease-recovery",
+      "result": "source-port-tested-WPCK21-PR24",
+      "enabled": true,
+      "sha256": "b06b2f6cf14a4e3d0ea5eeb988540cfd09963fb12ec6a029dd46d42ba8ea56dc"
+    }
+  ],
+  "external_queue_patch_state": "ported-and-verified-by-WPCK#21-PR#24-resulting-91b23b57",
+  "custom_css_js_state": "AEF#1446_source_and_synthetic_browser_tests_PASS; live_authenticated_compatibility_UNKNOWN",
+  "protected_runtime": "not-touched",
+  "source_checks": "Go1.27 queue/scheduler/rpc/GitHub test/race/vet PASS on exact resulting 91b23b57; pnpm frozen/Vite authentic web and Linux CGO0 server+agent build PASS; full server tests FAIL on same official upstream missing API helpers; CGO1/real SQLite parity NOT_PROVEN; 5-module Python upgrade operator 7/7 PASS local prior to next candidate source CI",
+  "queue_security_gate": "PASS_source_and_SQLite_unit_race_91b23b57; protected_runtime_not_approved",
+  "go_version": "go1.27.0",
+  "source_tests": {
+    "go_version": "go1.27.0",
+    "go_github_unit": "PASS",
+    "go_github_race": "PASS",
+    "go_github_vet": "PASS",
+    "go_github_gofmt": "PASS",
+    "go_queue_scheduler_rpc": "PASS_with_Sqlite_test_tag_and_race",
+    "pnpm_frozen_lockfile_install": "PASS",
+    "web_vite_build": "PASS",
+    "linux_server_cgo0_with_authentic_web_dist": "PASS",
+    "linux_agent_cgo0": "PASS",
+    "server_full_suite": "FAIL_known_upstream_server_api_repo_test_undefined_helpers",
+    "source_ci_exact_head": "PASS_on_91b23b57; new combined source HEAD pending",
+    "queue_custom_bounded_lease_behavior": "PASS_Sqlite_restart and three-exhausted leases, with Go1.27 test+race",
+    "linux_server_cgo1_sqlite_parity": "NOT_TESTED",
+    "isolated_runtime_smoke": "NOT_TESTED",
+    "python_upgrade_operator": "PASS_7_tests_5_module_checksum_verify_and_plan"
+  },
+  "build_artifacts": {
+    "server_linux_amd64_cgo0_sha256": "4287ad8349fbe54d27f5e1781852cb7813c9f58fece5e9b736d03be2cbbf7ae8",
+    "agent_linux_amd64_cgo0_sha256": "fa5fef35e0e54c3b3cbe6736300f2b928a230bff74fb5d66438ba596ee2b005e",
+    "authentic_frontend": "web/dist/index.html official pnpm@12.15.0 Vite sha256 bccd4a14ee2b7341ee9488e8bcd4432844c460343c1379ec26e33f4eaf9de12d",
+    "build_host": "Mac arm64 isolated temp toolchain and caches",
+    "production_parity": "NOT_PROVEN; CGO0 build is not equivalent to live CGO1/SQLite"
+  },
+  "full_suite_baseline": {
+    "package": "server/api",
+    "upstream_sha": "3f1bb0bd0db28e410ad797034d75780116122c91",
+    "result": "FAIL",
+    "observed": "server/api/repo_test.go undefined newTestStore/newTestContext/withUser/withRepo on exact pristine upstream version; same on candidate"
+  },
+  "upgrade_operator": {
+    "origin_issue": "WPCK#17",
+    "source_merged_revision": "ae678c3b00937506444a615f47b5b2cbbe65af86",
+    "modules_count": 5,
+    "source_only": true,
+    "local_tests": "7/7 PASS",
+    "plan": "PASS pinned official v3.20.1",
+    "live_changes": 0
+  }
+}

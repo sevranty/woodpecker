@@ -1,0 +1,382 @@
+diff --git a/server/forge/github/github.go b/server/forge/github/github.go
+index e5a100c..84e16d1 100644
+--- a/server/forge/github/github.go
++++ b/server/forge/github/github.go
+@@ -22,6 +22,7 @@ import (
+ 	"fmt"
+ 	"net/http"
+ 	"net/url"
++	"os"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+@@ -64,6 +65,15 @@ type Opts struct {
+ // New returns a Forge implementation that integrates with a GitHub Cloud or
+ // GitHub Enterprise version control hosting provider.
+ func New(id int64, opts Opts) (forge.Forge, error) {
++	statusRoute, err := wfo882LoadStatusRoute(os.Getenv, wfo882ReadProtectedToken)
++	if err != nil {
++		return nil, err
++	}
++	// A machine identity for github.com must never be routed to an arbitrary
++	// GitHub Enterprise server or a different API endpoint.
++	if statusRoute != nil && opts.URL != defaultURL {
++		return nil, errors.New("WFO882_CUSTOM_FORGE_NOT_ALLOWED")
++	}
+ 	r := &client{
+ 		id:         id,
+ 		API:        defaultAPI,
+@@ -74,6 +84,7 @@ func New(id int64, opts Opts) (forge.Forge, error) {
+ 		SkipVerify: opts.SkipVerify,
+ 		MergeRef:   opts.MergeRef,
+ 		OnlyPublic: opts.OnlyPublic,
++		wfo882:     statusRoute,
+ 	}
+ 	if opts.URL != defaultURL {
+ 		r.url = strings.TrimSuffix(opts.URL, "/")
+@@ -93,6 +104,7 @@ type client struct {
+ 	MergeRef      bool
+ 	OnlyPublic    bool
+ 	oAuthHost     string
++	wfo882        *wfo882StatusRoute
+ 	branchesCache branchCache
+ }
+ 
+@@ -575,7 +587,34 @@ var reDeploy = regexp.MustCompile(`.+/deployments/(\d+)`)
+ // Status sends the commit status to the forge.
+ // An example would be the GitHub pull request status.
+ func (c *client) Status(ctx context.Context, user *model.User, repo *model.Repo, pipeline *model.Pipeline, workflow *model.Workflow) error {
+-	client, err := c.newClientToken(ctx, user.AccessToken)
++	token := user.AccessToken
++	requestCtx := ctx
++	if pipeline.Event != model.EventDeploy && c.wfo882 != nil &&
++		wfo882AllowedStatusRepository(repo.Owner, repo.Name) {
++		var err error
++		token, err = c.wfo882.selectToken(repo.Owner, repo.Name, token, func(machineToken string) error {
++			// Ignore context-injected clients: account verification and the
++			// subsequent status write must use the SAME machine credential.
++			identityCtx := context.WithValue(ctx, githubClientKey, nil)
++			verifier, err := c.newClientToken(identityCtx, machineToken)
++			if err != nil {
++				return err
++			}
++			identity, _, err := verifier.Users.Get(identityCtx, "")
++			if err != nil {
++				return err
++			}
++			if identity.GetLogin() != wfo882Login {
++				return errors.New("WFO882_LOGIN_MISMATCH")
++			}
++			return nil
++		})
++		if err != nil {
++			return err
++		}
++		requestCtx = context.WithValue(ctx, githubClientKey, nil)
++	}
++	client, err := c.newClientToken(requestCtx, token)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/server/forge/github/wfo882_status_identity.go b/server/forge/github/wfo882_status_identity.go
+new file mode 100644
+index 0000000..d48d69e
+--- /dev/null
++++ b/server/forge/github/wfo882_status_identity.go
+@@ -0,0 +1,105 @@
++// Copyright 2026 Woodpecker Authors
++// Licensed under the Apache License, Version 2.0 (the "License").
++package github
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++)
++
++// The optional machine identity is statically assigned to these repositories.
++// It is never selected because another token returned HTTP 403 or 429.
++const (
++	wfo882Login         = "only50bw"
++	wfo882EnabledKey    = "WOODPECKER_WFO882_STATUS_IDENTITY_ENABLED"
++	wfo882OwnerKey      = "WOODPECKER_WFO882_OWNER_APPROVED"
++	wfo882ComplianceKey = "WOODPECKER_WFO882_COMPLIANCE_APPROVED"
++	wfo882TokenFileKey  = "WOODPECKER_WFO882_TOKEN_FILE"
++)
++
++type wfo882StatusRoute struct {
++	token           string
++	once            sync.Once
++	verificationErr error
++}
++
++func wfo882AllowedStatusRepository(owner, repo string) bool {
++	if owner != "sevranty" {
++		return false
++	}
++	switch repo {
++	case "telegram-bot-hub", "servers", "agent-execution-fabric", "web-factory-os":
++		return true
++	default:
++		return false
++	}
++}
++
++// wfo882LoadStatusRoute only loads an explicitly approved static credential.
++// A second identity is NOT a quota-fallback mechanism. Operator flags alone
++// do not prove contractual compliance or authorize a live deployment.
++func wfo882LoadStatusRoute(getenv func(string) string, readToken func(string) (string, error)) (*wfo882StatusRoute, error) {
++	enabled := getenv(wfo882EnabledKey)
++	owner := getenv(wfo882OwnerKey)
++	compliance := getenv(wfo882ComplianceKey)
++	path := getenv(wfo882TokenFileKey)
++
++	if enabled == "" && owner == "" && compliance == "" && path == "" {
++		return nil, nil
++	}
++	if enabled != "1" || owner != "1" || compliance != "1" || path == "" {
++		return nil, errors.New("WFO882_PROTECTED_ADMISSION_REQUIRED")
++	}
++	token, err := readToken(path)
++	if err != nil {
++		return nil, errors.New("WFO882_TOKEN_FILE_UNAVAILABLE")
++	}
++	if token == "" || strings.ContainsAny(token, "\r\n \t") {
++		return nil, errors.New("WFO882_TOKEN_FORMAT_INVALID")
++	}
++	return &wfo882StatusRoute{token: token}, nil
++}
++
++// A protected file is mandatory; no PAT is read from command-line arguments,
++// ordinary environment variables, GitHub Issues, logs or repository files.
++func wfo882ReadProtectedToken(path string) (string, error) {
++	if !filepath.IsAbs(path) {
++		return "", errors.New("WFO882_TOKEN_PATH_INVALID")
++	}
++	info, err := os.Lstat(path)
++	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 ||
++		info.Size() < 8 || info.Size() > 4096 {
++		return "", errors.New("WFO882_TOKEN_FILE_UNSAFE")
++	}
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return "", errors.New("WFO882_TOKEN_READ_FAILED")
++	}
++	token := strings.TrimSpace(string(raw))
++	if token == "" || strings.ContainsAny(token, "\r\n \t") {
++		return "", errors.New("WFO882_TOKEN_FORMAT_INVALID")
++	}
++	return token, nil
++}
++
++// selectToken is invoked only for a non-deployment status in an allowed repo.
++// verify must independently call GET /user with THIS credential and confirm
++// login=only50bw. A rejected verification is sticky until service restart;
++// no fallback to the original token occurs after admission.
++func (r *wfo882StatusRoute) selectToken(
++	owner, repo, existingToken string, verify func(string) error,
++) (string, error) {
++	if r == nil || !wfo882AllowedStatusRepository(owner, repo) {
++		return existingToken, nil
++	}
++	r.once.Do(func() {
++		r.verificationErr = verify(r.token)
++	})
++	if r.verificationErr != nil {
++		return "", errors.New("WFO882_MACHINE_IDENTITY_NOT_VERIFIED")
++	}
++	return r.token, nil
++}
+diff --git a/server/forge/github/wfo882_status_identity_test.go b/server/forge/github/wfo882_status_identity_test.go
+new file mode 100644
+index 0000000..7b53d88
+--- /dev/null
++++ b/server/forge/github/wfo882_status_identity_test.go
+@@ -0,0 +1,185 @@
++package github
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++)
++
++func TestWFO882AllowlistExact(t *testing.T) {
++	for _, repo := range []string{"telegram-bot-hub", "servers", "agent-execution-fabric", "web-factory-os"} {
++		if !wfo882AllowedStatusRepository("sevranty", repo) {
++			t.Errorf("allowed repo rejected: %s", repo)
++		}
++	}
++	for _, pair := range [][2]string{
++		{"other", "servers"},
++		{"sevranty", "lifeops"},
++		{"sevranty", "../servers"},
++		{"Sevranty", "servers"},
++		{"sevranty", "servers/extra"},
++		{"", "servers"},
++	} {
++		if wfo882AllowedStatusRepository(pair[0], pair[1]) {
++			t.Errorf("unauthorized repo accepted: %v", pair)
++		}
++	}
++}
++
++func TestWFO882DefaultAndPartialAdmissionFailClosed(t *testing.T) {
++	tests := []struct {
++		name string
++		vars map[string]string
++		good bool
++	}{
++		{name: "default-disabled", vars: nil, good: true},
++		{name: "enabled-without-approval", vars: map[string]string{wfo882EnabledKey: "1"}},
++		{name: "file-only", vars: map[string]string{wfo882TokenFileKey: "/secure/token"}},
++		{name: "no-compliance", vars: map[string]string{
++			wfo882EnabledKey: "1", wfo882OwnerKey: "1", wfo882TokenFileKey: "/secure/token",
++		}},
++		{name: "all-guards", vars: map[string]string{
++			wfo882EnabledKey: "1", wfo882OwnerKey: "1",
++			wfo882ComplianceKey: "1", wfo882TokenFileKey: "/secure/token",
++		}, good: true},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			calls := 0
++			getenv := func(key string) string { return tc.vars[key] }
++			readToken := func(path string) (string, error) {
++				calls++
++				if path != "/secure/token" {
++					t.Fatal("unexpected file path")
++				}
++				return "test-only-secondary", nil
++			}
++			route, err := wfo882LoadStatusRoute(getenv, readToken)
++			if tc.good && err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if !tc.good && err == nil {
++				t.Fatal("incomplete admission accepted")
++			}
++			if tc.name == "default-disabled" && (route != nil || calls != 0) {
++				t.Fatal("default path read token")
++			}
++			if !tc.good && calls != 0 {
++				t.Fatal("incomplete admission read token")
++			}
++			if tc.name == "all-guards" && (route == nil || calls != 1) {
++				t.Fatal("admitted route not loaded")
++			}
++		})
++	}
++}
++
++func TestWFO882ProtectedFileAndSymlink(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "token")
++	if err := os.WriteFile(path, []byte("test-only-secret\n"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	token, err := wfo882ReadProtectedToken(path)
++	if err != nil || token != "test-only-secret" {
++		t.Fatalf("private file rejected: %v", err)
++	}
++	if err := os.Chmod(path, 0644); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := wfo882ReadProtectedToken(path); err == nil {
++		t.Fatal("world-readable secret accepted")
++	}
++	if err := os.Chmod(path, 0600); err != nil {
++		t.Fatal(err)
++	}
++	link := filepath.Join(dir, "symlink")
++	if err := os.Symlink(path, link); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := wfo882ReadProtectedToken(link); err == nil {
++		t.Fatal("symlink secret accepted")
++	}
++	if _, err := wfo882ReadProtectedToken("relative"); err == nil {
++		t.Fatal("relative secret path accepted")
++	}
++}
++
++func TestWFO882SelectTokenNoFallback(t *testing.T) {
++	route := &wfo882StatusRoute{token: "only50bw-test"}
++	calls := 0
++	verify := func(token string) error {
++		calls++
++		if token != "only50bw-test" {
++			t.Fatal("unexpected credential passed")
++		}
++		return nil
++	}
++	for range 2 {
++		token, err := route.selectToken("sevranty", "servers", "existing", verify)
++		if err != nil || token != "only50bw-test" {
++			t.Fatalf("wrong identity returned: %q, %v", token, err)
++		}
++	}
++	if calls != 1 {
++		t.Fatalf("verification called %d times", calls)
++	}
++	token, err := route.selectToken("sevranty", "lifeops", "existing", verify)
++	if err != nil || token != "existing" || calls != 1 {
++		t.Fatal("non-target repo switched identity")
++	}
++}
++
++func TestWFO882RejectedVerificationStaysBlocked(t *testing.T) {
++	route := &wfo882StatusRoute{token: "secret-sentinel"}
++	verify := func(token string) error { return errors.New("HTTP 403: secret-sentinel") }
++	for range 2 {
++		token, err := route.selectToken("sevranty", "servers", "existing", verify)
++		if token != "" || err == nil || strings.Contains(err.Error(), "sentinel") {
++			t.Fatalf("verification failure leaked token or fell back: %q, %v", token, err)
++		}
++	}
++}
++
++func TestWFO882ConcurrentVerificationSingleCall(t *testing.T) {
++	route := &wfo882StatusRoute{token: "only50bw-test"}
++	var calls atomic.Int32
++	var wg sync.WaitGroup
++	for range 30 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			token, err := route.selectToken("sevranty", "web-factory-os", "existing", func(token string) error {
++				calls.Add(1)
++				return nil
++			})
++			if err != nil || token != "only50bw-test" {
++				t.Errorf("concurrent route: %q, %v", token, err)
++			}
++		}()
++	}
++	wg.Wait()
++	if calls.Load() != 1 {
++		t.Fatalf("expected single verification, got %d", calls.Load())
++	}
++}
++
++func TestWFO882InvalidCredentialNeverReadFromProcessEnv(t *testing.T) {
++	flags := map[string]string{
++		wfo882EnabledKey: "1", wfo882OwnerKey: "1",
++		wfo882ComplianceKey: "1", wfo882TokenFileKey: "/secure/token",
++	}
++	for _, token := range []string{"", "bad token", "bad\r\ntoken"} {
++		_, err := wfo882LoadStatusRoute(
++			func(k string) string { return flags[k] },
++			func(string) (string, error) { return token, nil },
++		)
++		if err == nil || (token != "" && strings.Contains(err.Error(), token)) {
++			t.Fatalf("invalid token accepted or disclosed: %q", token)
++		}
++	}
++}
