@@ -34,6 +34,10 @@ type Task struct {
 	AgentID      int64                  `json:"agent_id"     xorm:"'agent_id'"`
 	PipelineID   int64                  `json:"pipeline_id"  xorm:"'pipeline_id'"`
 	RepoID       int64                  `json:"repo_id"      xorm:"'repo_id'"`
+	// LeaseAttempts is persisted while an expired task waits for re-dispatch.
+	// It makes the retry budget survive a server restart instead of resetting
+	// every time the in-memory queue is rebuilt.
+	LeaseAttempts int `json:"lease_attempts" xorm:"NOT NULL DEFAULT 0 'lease_attempts'"`
 	// ConcurrencyLimit is the maximum number of tasks sharing the same
 	// ConcurrencyGroup that may run at once. A value <= 0 means unlimited.
 	ConcurrencyLimit int `json:"concurrency_limit" xorm:"NOT NULL DEFAULT 0 'concurrency_limit'"`

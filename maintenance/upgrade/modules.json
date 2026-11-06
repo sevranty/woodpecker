@@ -77,6 +77,24 @@
         "go test ./server/forge/github"
       ],
       "rollback": "remove module in source candidate and rebuild; never edit live config"
+    },
+    {
+      "id": "queue-lease-recovery",
+      "owner_issue": "WPCK#21",
+      "source_from": "49dce43bc1d20c68e17e479f7a92f0f12ef8c3b0",
+      "source_origin": "WFO#770 and WFO#773 verified queue patches, adapted to v3.20.1",
+      "patch_path": "maintenance/upgrade/patches/queue-lease-recovery.patch",
+      "patch_sha256": "b06b2f6cf14a4e3d0ea5eeb988540cfd09963fb12ec6a029dd46d42ba8ea56dc",
+      "size_bytes": 82872,
+      "description": "Lease recovery, stale task validation, step reset, durable bounded retries with SQLite",
+      "default_disabled": false,
+      "applicability": "apply after existing four modules; re-evaluate upstream absorption for every newer tag",
+      "status": "v3.20.1-verified-locally-not-released",
+      "tests": [
+        "go test -count=1 ./server/queue ./server/scheduler ./server/rpc",
+        "go test -race -tags test -count=1 -run TestPersistentSQLiteLeaseRetryBudgetSurvivesRestartAndTerminates ./server/queue"
+      ],
+      "rollback": "omit this module on next source-only build and rerun negative queue tests; no live replacement"
     }
   ],
   "external_decisions": [
@@ -87,8 +105,8 @@
         "WFO#773"
       ],
       "source": "https://github.com/sevranty/web-factory-os/issues/771",
-      "status": "not-in-wpck-v3.19.0-source",
-      "next": "prove upstream 3.20.1 queue semantics and decide exact port, do not claim present in current live binary"
+      "status": "ported-in-WPCK#21-to-v3.20.1-source-only",
+      "next": "check upstream absorption and actual SQLite schema migration before protected release"
     },
     {
       "id": "ui-custom-assets",

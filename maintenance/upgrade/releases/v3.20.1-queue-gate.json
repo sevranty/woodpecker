@@ -23,15 +23,25 @@
     {
       "source": "WFO-319-redispatch/wfo773-bounded-retries.patch",
       "sha256": "b66e8775627bf83d8bf96c03557f9422d0ec9cff10b4496ce832de7c8e38e599",
-      "status": "CONFLICT",
-      "errors": [
-        "error: patch failed: server/queue/persistent.go:27",
-        "error: server/queue/persistent.go: patch does not apply",
-        "error: server/queue/persistent_sqlite_test.go: No such file or directory"
-      ]
+      "status": "ADAPTED_AND_TESTED",
+      "errors": [],
+      "adaptation": "WPCK#21: preserve 3.20.1 pause-state restore and queue validation; add lease retry budget with SQLite persistence, source-only"
     }
   ],
-  "decision": "UNRESOLVED: 3 WFO patch --check clean yet not applied; fourth bounded retry patch conflicts, requiring owned port and regression tests. Do not deploy.",
+  "decision": "WPCK#21 LOCAL_SOURCE_PASS: all four historical queue patches ported; pending independent exact HEAD tests and protected release",
   "source": "https://github.com/sevranty/web-factory-os/issues/771",
-  "exact_upstream_queue_suite": "PASS on Mac with Go 1.27.0: ./server/queue ./server/scheduler ./server/rpc"
+  "exact_upstream_queue_suite": "PASS on Mac with Go 1.27.0: ./server/queue ./server/scheduler ./server/rpc",
+  "result_patch_path": "maintenance/upgrade/patches/queue-lease-recovery.patch",
+  "result_patch_sha256": "b06b2f6cf14a4e3d0ea5eeb988540cfd09963fb12ec6a029dd46d42ba8ea56dc",
+  "verification": {
+    "go1.27_queue_scheduler_rpc": "PASS",
+    "sqlite_restart_and_bounded_retry": "PASS",
+    "sqlite_bounded_retry_race": "PASS",
+    "go_vet": "PASS",
+    "github_exact_head": "PENDING",
+    "live_release": "NOT_AUTHORIZED",
+    "go1.27_full_queue_scheduler_rpc_with_sqlite_build_tag": "PASS",
+    "go1.27_full_race_queue_scheduler_rpc_with_sqlite_build_tag": "PASS",
+    "patch_applies_to_wpck16_exact_source": "PASS"
+  }
 }
