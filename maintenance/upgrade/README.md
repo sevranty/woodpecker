@@ -25,3 +25,24 @@ Use a clean upstream tag as a new release base. Apply the four exact SHA256-pinn
 - Run SHA256 integrity, `git diff --check`, formatting, Go unit/race/vet, complete server test with baseline delta, authentic web build, isolated server/agent/SQLite tests, GitHub status delivery and metrics.
 - Source PR merge is not runtime deployment. Live release requires SRV#863 / WFO#1016 protected approval and proof of recovery.
 - Retain exact previous source commit, binary checksums, DB/WAL backup consistency, asset checksums and rollback. Do not interrupt SRV#837 observation.
+
+## 3.20.1 candidate: five modules and verified upgrade operator (WFO#1016)
+
+This historical manifest started with four GitHub/source modules from the 3.19.0 fork.
+For the 3.20.1 candidate, WPCK#21 independently ported bounded SQLite lease recovery,
+restart persistence, safe re-dispatch and reset of prior successful steps. The fifth
+`queue-lease-recovery` patch is SHA256-pinned in the versioned `modules.json`.
+Apply order is GitHub cache -> status route (OFF by default) -> HTTP metrics ->
+source CI -> queue lease recovery. Never assert an upstream change was absorbed
+without a failing-before and passing-after contract test.
+
+The source-only operator `maintenance/upgrade/scripts/upgrade.py` (from WPCK#17)
+now loads all five modules, verifies hashes, pins official upstream SHA and
+generates isolated reviewed worktrees. `verify/plan/apply` never pushes, deploys,
+changes live settings, reads secrets or modifies services. `apply` deliberately
+returns a conflict requiring human/code review for upstream drift; **a new version
+is not automatically safe to publish**. Source tests include Python compilation,
+7 regression tests, failure on tool-output contamination, GitHub/queue Go tests,
+and authentic frontend + server/agent build before release. Live release still
+requires SRV#863 protected gates (CGO1/SQLite, real DB backup/restore, CSS/JS,
+post-release metrics and owner approval).
