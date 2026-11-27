@@ -15,6 +15,7 @@
 package datastore
 
 import (
+	"errors"
 	"fmt"
 
 	"go.woodpecker-ci.org/woodpecker/v3/server/model"
@@ -48,10 +49,10 @@ func (s storage) TaskInsertBatch(tasks []*model.Task) error {
 	seen := make(map[string]struct{}, len(tasks))
 	for _, task := range tasks {
 		if task == nil || task.ID == "" {
-			return fmt.Errorf("task batch contains a nil task or empty ID")
+			return errors.New("task batch contains a nil task or empty ID")
 		}
 		if _, exists := seen[task.ID]; exists {
-			return fmt.Errorf("task batch contains a duplicate ID")
+			return errors.New("task batch contains a duplicate ID")
 		}
 		seen[task.ID] = struct{}{}
 	}
@@ -65,8 +66,12 @@ func (s storage) TaskInsertBatch(tasks []*model.Task) error {
 
 	for _, task := range tasks {
 		copyTask := *task
-		if err := wrapInsert(sess.Insert(&copyTask)); err != nil {
+		count, err := sess.Insert(&copyTask)
+		if err := wrapInsert(count, err); err != nil {
 			return err
+		}
+		if count != 1 {
+			return fmt.Errorf("task batch insert affected %d rows, expected one", count)
 		}
 	}
 	return sess.Commit()
