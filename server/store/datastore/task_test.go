@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"go.woodpecker-ci.org/woodpecker/v3/server/model"
 )
@@ -45,4 +46,79 @@ func TestTaskList(t *testing.T) {
 	list, err = store.TaskList()
 	assert.NoError(t, err)
 	assert.Len(t, list, 0, "Want empty task list after delete")
+}
+
+func TestTaskInsertBatch(t *testing.T) {
+	store, closer := newTestStore(t, new(model.Task))
+	defer closer()
+
+	assert.NoError(t, store.TaskInsertBatch(nil))
+	assert.Error(t, store.TaskInsertBatch([]*model.Task{{ID: "not-inserted"}, nil}))
+	assert.Error(t, store.TaskInsertBatch([]*model.Task{{ID: ""}}))
+	assert.Error(t, store.TaskInsertBatch([]*model.Task{{ID: "repeat"}, {ID: "repeat"}}))
+
+	list, err := store.TaskList()
+	require.NoError(t, err)
+	require.Empty(t, list)
+
+	require.NoError(t, store.TaskInsertBatch([]*model.Task{
+		{ID: "first", Data: []byte("one")},
+		{ID: "second", Data: []byte("two")},
+	}))
+	list, err = store.TaskList()
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	data := make(map[string]string)
+	for _, task := range list {
+		data[task.ID] = string(task.Data)
+	}
+	assert.Equal(t, map[string]string{"first": "one", "second": "two"}, data)
+}
+
+func TestTaskInsertBatchRollback(t *testing.T) {
+	store, closer := newTestStore(t, new(model.Task))
+	defer closer()
+
+	require.NoError(t, store.TaskInsert(&model.Task{ID: "existing", Data: []byte("keep")}))
+	require.Error(t, store.TaskInsertBatch([]*model.Task{
+		{ID: "before"},
+		{ID: "existing", Data: []byte("replace")},
+		{ID: "after"},
+	}))
+
+	list, err := store.TaskList()
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "existing", list[0].ID)
+	assert.Equal(t, "keep", string(list[0].Data))
+}
+
+func TestTaskInsertBatchCompetingAdmissions(t *testing.T) {
+	store, closer := newTestStore(t, new(model.Task))
+	defer closer()
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, id := range []string{"left", "right"} {
+		go func(id string) {
+			<-start
+			results <- store.TaskInsertBatch([]*model.Task{
+				{ID: id},
+				{ID: "shared"},
+			})
+		}(id)
+	}
+	close(start)
+	first, second := <-results, <-results
+	require.NotEqual(t, first == nil, second == nil, "exactly one competing batch commits")
+
+	list, err := store.TaskList()
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+	ids := make(map[string]bool)
+	for _, task := range list {
+		ids[task.ID] = true
+	}
+	assert.True(t, ids["shared"])
+	assert.NotEqual(t, ids["left"], ids["right"])
 }
