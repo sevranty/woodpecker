@@ -122,3 +122,24 @@ func TestTaskInsertBatchCompetingAdmissions(t *testing.T) {
 	assert.True(t, ids["shared"])
 	assert.NotEqual(t, ids["left"], ids["right"])
 }
+
+func TestTaskInsertBatchZeroRows(t *testing.T) {
+	driver, _ := testDriverConfig()
+	if driver != "sqlite3" {
+		t.Skip("SQLite trigger fixture")
+	}
+	store, closer := newTestStore(t, new(model.Task))
+	defer closer()
+
+	_, err := store.engine.Exec(`CREATE TRIGGER ignore_task BEFORE INSERT ON tasks
+		WHEN NEW.id = 'ignored' BEGIN SELECT RAISE(IGNORE); END`)
+	require.NoError(t, err)
+	require.Error(t, store.TaskInsertBatch([]*model.Task{
+		{ID: "before"},
+		{ID: "ignored"},
+		{ID: "after"},
+	}))
+	list, err := store.TaskList()
+	require.NoError(t, err)
+	require.Empty(t, list)
+}
